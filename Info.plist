@@ -14,6 +14,8 @@
     <string>1.0</string>
     <key>CFBundleVersion</key>
     <string>1</string>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>Notch needs automation access to read media info from browsers and control playback in music apps.</string>
     <key>LSMinimumSystemVersion</key>
     <string>12.0</string>
     <key>LSUIElement</key>

@@ -33,6 +33,17 @@ final class NowPlayingManager: ObservableObject {
     @Published var isPlaying: Bool = false
     @Published var nowPlayingAppIcon: NSImage?
     @Published var nowPlayingArtwork: NSImage?
+    @Published var trackTitle: String?
+    @Published var trackArtist: String?
+    @Published var trackAlbum: String?
+    @Published var nowPlayingAppName: String?
+    @Published var isEligibleSource: Bool = false
+    @Published var isBrowserSource: Bool = false
+    @Published var cachedTrackTitle: String?
+    @Published var cachedTrackArtist: String?
+    @Published var cachedTrackAlbum: String?
+    @Published var cachedArtwork: NSImage?
+    @Published var lastControllableSource: String?
 
     private let bundle: CFBundle?
     private let queue = DispatchQueue.main
@@ -43,6 +54,15 @@ final class NowPlayingManager: ObservableObject {
     private var lastVoxTrackURL: String?
     private var lastVoxFetchAt: Date = .distantPast
     private var lastVoxFallbackKey: String?
+    private var lastSourceBundleID: String?
+    private var lastAudioSeenAt: Date = .distantPast
+    @Published var lastTrackUpdateAt: Date = .distantPast
+    @Published var lastArtworkUpdateAt: Date = .distantPast
+    private var lastSpotifyWebEligibleAt: Date = .distantPast
+    @Published var lastPermissionRequestAt: Date = .distantPast
+    private var lastBraveMetaFetchAt: Date = .distantPast
+    private var lastBraveMetaKey: String?
+    private let didRequestBrowserPermissionKey = "NotchDidRequestBrowserPermission"
 
     private typealias MRRegisterFn = @convention(c) (DispatchQueue) -> Void
     private typealias MRGetPIDFn = @convention(c) (DispatchQueue, @escaping (Int32) -> Void) -> Void
@@ -120,6 +140,10 @@ final class NowPlayingManager: ObservableObject {
                 guard playing else {
                     // Fall through to CoreAudio below (some systems report playing=false even when audio is active).
                     self.nowPlayingArtwork = nil
+                    self.trackTitle = nil
+                    self.trackArtist = nil
+                    self.trackAlbum = nil
+                    self.isEligibleSource = false
                     self.updateFromCoreAudio()
                     return
                 }
@@ -130,8 +154,33 @@ final class NowPlayingManager: ObservableObject {
                     if let data = info["kMRMediaRemoteNowPlayingInfoArtworkData"] as? Data,
                        let image = NSImage(data: data) {
                         self.nowPlayingArtwork = image
+                        self.cachedArtwork = image
+                        self.lastArtworkUpdateAt = Date()
                     } else {
                         self.nowPlayingArtwork = nil
+                    }
+
+                    let title = info["kMRMediaRemoteNowPlayingInfoTitle"] as? String
+                    let artist = info["kMRMediaRemoteNowPlayingInfoArtist"] as? String
+                    let album = info["kMRMediaRemoteNowPlayingInfoAlbum"] as? String
+                    let trimmedTitle = title?.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let trimmedArtist = artist?.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let trimmedAlbum = album?.trimmingCharacters(in: .whitespacesAndNewlines)
+
+                    if let t = trimmedTitle, !t.isEmpty {
+                        self.trackTitle = t
+                        self.cachedTrackTitle = t
+                        self.lastTrackUpdateAt = Date()
+                    }
+                    if let a = trimmedArtist, !a.isEmpty {
+                        self.trackArtist = a
+                        self.cachedTrackArtist = a
+                        self.lastTrackUpdateAt = Date()
+                    }
+                    if let a = trimmedAlbum, !a.isEmpty {
+                        self.trackAlbum = a
+                        self.cachedTrackAlbum = a
+                        self.lastTrackUpdateAt = Date()
                     }
                 }
 
@@ -143,6 +192,18 @@ final class NowPlayingManager: ObservableObject {
                         return
                     }
                     self.nowPlayingAppIcon = app.icon?.withMinimalistColors()
+                    self.nowPlayingAppName = app.localizedName
+                    self.lastSourceBundleID = app.bundleIdentifier
+                    self.isEligibleSource = Self.isEligibleSource(bundleID: app.bundleIdentifier, name: app.localizedName)
+                    self.isBrowserSource = Self.isBrowser(bundleID: app.bundleIdentifier, name: app.localizedName)
+                    if self.isEligibleSource {
+                        self.lastControllableSource = Self.sourceKey(bundleID: app.bundleIdentifier, name: app.localizedName)
+                    }
+
+                    // If this is a browser, refine eligibility by checking the active tab URL.
+                    if Self.isBrowser(bundleID: app.bundleIdentifier, name: app.localizedName) {
+                        self.maybeUpdateEligibilityFromBrave()
+                    }
                 }
             }
             return
@@ -155,25 +216,180 @@ final class NowPlayingManager: ObservableObject {
     private func updateFromCoreAudio() {
         if let pid = Self.currentlyRunningOutputPID(),
            let app = NSRunningApplication(processIdentifier: pid) {
+            lastAudioSeenAt = Date()
+            let bundleID = app.bundleIdentifier
+            let sourceChanged = (bundleID != lastSourceBundleID)
+            lastSourceBundleID = bundleID
+
             self.isPlaying = true
             self.nowPlayingAppIcon = app.icon?.withMinimalistColors()
-            self.nowPlayingArtwork = nil
+            self.nowPlayingAppName = app.localizedName
+            self.isEligibleSource = Self.isEligibleSource(bundleID: bundleID, name: app.localizedName)
+            self.isBrowserSource = Self.isBrowser(bundleID: bundleID, name: app.localizedName)
+            if self.isEligibleSource {
+                self.lastControllableSource = Self.sourceKey(bundleID: bundleID, name: app.localizedName)
+            }
+
+            if sourceChanged {
+                self.nowPlayingArtwork = nil
+                self.trackTitle = nil
+                self.trackArtist = nil
+                self.trackAlbum = nil
+                self.cachedTrackTitle = nil
+                self.cachedTrackArtist = nil
+                self.cachedTrackAlbum = nil
+                self.cachedArtwork = nil
+            }
 
             // If the audio source is Brave, try to resolve artwork from the active tab URL
             // (Spotify/YouTube web players commonly run in Brave).
             if let bundleID = app.bundleIdentifier, bundleID.contains("brave") {
+                self.maybeUpdateEligibilityFromBrave()
                 self.maybeUpdateArtworkFromBraveActiveTab()
+                self.maybeUpdateNowPlayingFromBraveWeb()
             }
 
             // VOX local files: ask VOX for the track URL and extract embedded artwork.
             if app.localizedName == "Vox" || app.localizedName == "VOX" || (app.bundleIdentifier?.contains("Vox") == true) {
                 self.maybeUpdateArtworkFromVox()
+            } else {
+                if sourceChanged {
+                    self.trackTitle = nil
+                    self.trackArtist = nil
+                    self.trackAlbum = nil
+                    self.cachedTrackTitle = nil
+                    self.cachedTrackArtist = nil
+                    self.cachedTrackAlbum = nil
+                }
             }
         } else {
+            let now = Date()
+            let grace: TimeInterval = 1.5
+            if now.timeIntervalSince(lastAudioSeenAt) < grace {
+                return
+            }
             self.isPlaying = false
             self.nowPlayingAppIcon = nil
             self.nowPlayingArtwork = nil
+            self.trackTitle = nil
+            self.trackArtist = nil
+            self.trackAlbum = nil
+            self.cachedTrackTitle = nil
+            self.cachedTrackArtist = nil
+            self.cachedTrackAlbum = nil
+            self.cachedArtwork = nil
+            self.nowPlayingAppName = nil
+            self.lastSourceBundleID = nil
+            self.isEligibleSource = false
+            self.isBrowserSource = false
+            self.lastControllableSource = nil
         }
+    }
+
+    func requestBrowserPermissionIfNeeded() {
+        let already = UserDefaults.standard.bool(forKey: didRequestBrowserPermissionKey)
+        if already { return }
+        UserDefaults.standard.set(true, forKey: didRequestBrowserPermissionKey)
+        lastPermissionRequestAt = Date()
+        _ = Self.braveActiveTabURLString()
+    }
+
+    private func maybeUpdateEligibilityFromBrave() {
+        let now = Date()
+        guard let tabURLString = Self.braveActiveTabURLString(),
+              let url = URL(string: tabURLString) else {
+            // If we can't read the tab (permissions), keep eligibility briefly to avoid flicker.
+            self.isEligibleSource = now.timeIntervalSince(lastSpotifyWebEligibleAt) < 30.0
+            return
+        }
+        let host = url.host?.lowercased() ?? ""
+        if host.contains("open.spotify.com") {
+            self.isEligibleSource = true
+            self.lastSpotifyWebEligibleAt = now
+        } else {
+            self.isEligibleSource = now.timeIntervalSince(lastSpotifyWebEligibleAt) < 30.0
+        }
+    }
+
+    private struct BraveWebInfo {
+        let title: String
+        let artist: String
+        let artworkURL: String
+    }
+
+    private func maybeUpdateNowPlayingFromBraveWeb() {
+        let now = Date()
+        guard now.timeIntervalSince(lastBraveMetaFetchAt) > 1.0 else { return }
+        lastBraveMetaFetchAt = now
+
+        guard let tabURLString = Self.braveActiveTabURLString(),
+              let url = URL(string: tabURLString),
+              (url.host?.lowercased().contains("open.spotify.com") == true) else {
+            return
+        }
+
+        guard let info = Self.braveWebNowPlayingInfo() else { return }
+        let key = "\(info.title)|\(info.artist)|\(info.artworkURL)"
+        if key == lastBraveMetaKey { return }
+        lastBraveMetaKey = key
+
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            let t = info.title.trimmingCharacters(in: .whitespacesAndNewlines)
+            let a = info.artist.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !t.isEmpty {
+                self.trackTitle = t
+                self.cachedTrackTitle = t
+                self.lastTrackUpdateAt = Date()
+            }
+            if !a.isEmpty {
+                self.trackArtist = a
+                self.cachedTrackArtist = a
+                self.lastTrackUpdateAt = Date()
+            }
+            if !t.isEmpty || !a.isEmpty {
+                self.lastControllableSource = "brave-spotify"
+                self.isEligibleSource = true
+            }
+        }
+
+        if !info.artworkURL.isEmpty, let artURL = URL(string: info.artworkURL) {
+            Task { [weak self] in
+                guard let self else { return }
+                if let img = await Self.downloadImage(artURL) {
+                    await MainActor.run {
+                        self.nowPlayingArtwork = img
+                        self.cachedArtwork = img
+                        self.lastArtworkUpdateAt = Date()
+                    }
+                }
+            }
+        }
+    }
+
+    private static func isBrowser(bundleID: String?, name: String?) -> Bool {
+        let id = bundleID?.lowercased() ?? ""
+        let n = name?.lowercased() ?? ""
+        return id.contains("brave") || id.contains("chrome") || id.contains("edge") || id.contains("safari") || id.contains("arc") || n.contains("brave") || n.contains("chrome") || n.contains("edge") || n.contains("safari") || n.contains("arc")
+    }
+
+    private static func isEligibleSource(bundleID: String?, name: String?) -> Bool {
+        let id = bundleID?.lowercased() ?? ""
+        let n = name?.lowercased() ?? ""
+        if id.contains("com.spotify.client") || n.contains("spotify") { return true }
+        if id.contains("com.apple.music") || n == "music" { return true }
+        if id.contains("vox") || n.contains("vox") { return true }
+        return false
+    }
+
+    private static func sourceKey(bundleID: String?, name: String?) -> String? {
+        let id = bundleID?.lowercased() ?? ""
+        let n = name?.lowercased() ?? ""
+        if id.contains("com.spotify.client") || n.contains("spotify") { return "spotify" }
+        if id.contains("com.apple.music") || n == "music" { return "music" }
+        if id.contains("vox") || n.contains("vox") { return "vox" }
+        if id.contains("brave") || n.contains("brave") { return "brave-spotify" }
+        return nil
     }
 
     private func maybeUpdateArtworkFromBraveActiveTab() {
@@ -208,23 +424,40 @@ final class NowPlayingManager: ObservableObject {
         lastVoxFetchAt = now
 
         guard let info = Self.voxNowPlayingInfo() else { return }
-        let trackURLString = info.trackURL
-        guard !trackURLString.isEmpty else { return }
-        guard trackURLString != lastVoxTrackURL else { return }
-        lastVoxTrackURL = trackURLString
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            let t = info.track.trimmingCharacters(in: .whitespacesAndNewlines)
+            let a = info.artist.trimmingCharacters(in: .whitespacesAndNewlines)
+            let al = info.album.trimmingCharacters(in: .whitespacesAndNewlines)
 
-        guard let trackURL = Self.parseTrackURL(trackURLString) else { return }
+            if !t.isEmpty { self.trackTitle = t; self.cachedTrackTitle = t }
+            if !a.isEmpty { self.trackArtist = a; self.cachedTrackArtist = a }
+            if !al.isEmpty { self.trackAlbum = al; self.cachedTrackAlbum = al }
+            if !t.isEmpty || !a.isEmpty || !al.isEmpty {
+                self.lastTrackUpdateAt = Date()
+            }
+        }
+        let trackURLString = info.trackURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let canTryEmbedded = !trackURLString.isEmpty && trackURLString != lastVoxTrackURL
+        if canTryEmbedded {
+            lastVoxTrackURL = trackURLString
+        }
 
         Task { [weak self] in
             guard let self else { return }
-            if let artwork = await Self.embeddedArtwork(for: trackURL) {
-                await MainActor.run {
-                    self.nowPlayingArtwork = artwork
+
+            if canTryEmbedded, let trackURL = Self.parseTrackURL(trackURLString) {
+                if let artwork = await Self.embeddedArtwork(for: trackURL) {
+                    await MainActor.run {
+                        self.nowPlayingArtwork = artwork
+                        self.cachedArtwork = artwork
+                        self.lastArtworkUpdateAt = Date()
+                    }
+                    return
                 }
-                return
             }
 
-            // If no embedded artwork, fall back to a web lookup using VOX's metadata.
+            // Fallback: iTunes/Apple Music lookup using VOX metadata.
             let key = "\(info.artist)|\(info.album)|\(info.track)"
             if self.lastVoxFallbackKey == key { return }
             self.lastVoxFallbackKey = key
@@ -232,6 +465,8 @@ final class NowPlayingManager: ObservableObject {
             if let artwork = await Self.lookupArtwork(artist: info.artist, album: info.album, track: info.track) {
                 await MainActor.run {
                     self.nowPlayingArtwork = artwork
+                    self.cachedArtwork = artwork
+                    self.lastArtworkUpdateAt = Date()
                 }
             }
         }
@@ -358,18 +593,65 @@ final class NowPlayingManager: ObservableObject {
         return out.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    private static func braveWebNowPlayingInfo() -> BraveWebInfo? {
+        let js = """
+        (function(){
+          const titleEl = document.querySelector('[data-testid="nowplaying-track-link"]');
+          const artistEl = document.querySelector('[data-testid="nowplaying-artist"] a') ||
+                           document.querySelector('[data-testid="nowplaying-artist"]');
+          const imgEl = document.querySelector('img[aria-label="Cover art"]') ||
+                        document.querySelector('img[alt*="Cover"]') ||
+                        document.querySelector('img[alt*="cover"]');
+
+          const title = titleEl ? titleEl.textContent : "";
+          const artist = artistEl ? artistEl.textContent : "";
+          const artwork = imgEl ? imgEl.src : "";
+
+          return JSON.stringify({ title: title, artist: artist, artwork: artwork });
+        })();
+        """
+
+        let escapedJS = js.replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+            .replacingOccurrences(of: "\n", with: " ")
+
+        let script = """
+        tell application "Brave Browser"
+            if (count of windows) = 0 then return ""
+            set theTab to active tab of front window
+            set result to execute javascript "\(escapedJS)" in theTab
+            return result
+        end tell
+        """
+
+        let proc = Process()
+        proc.launchPath = "/usr/bin/osascript"
+        proc.arguments = ["-e", script]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = Pipe()
+        do { try proc.run() } catch { return nil }
+        proc.waitUntilExit()
+
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        guard let out = String(data: data, encoding: .utf8) else { return nil }
+        let trimmed = out.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let jsonData = trimmed.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any] else {
+            return nil
+        }
+
+        return BraveWebInfo(
+            title: (obj["title"] as? String) ?? "",
+            artist: (obj["artist"] as? String) ?? "",
+            artworkURL: (obj["artwork"] as? String) ?? ""
+        )
+    }
+
     private static func artworkForWebMedia(pageURL: URL) async -> NSImage? {
         // Spotify oEmbed (no auth) -> thumbnail_url
         if pageURL.host?.contains("open.spotify.com") == true {
             if let imageURL = await oEmbedThumbnailURL(provider: "spotify", pageURL: pageURL),
-               let img = await downloadImage(imageURL) {
-                return img
-            }
-        }
-
-        // YouTube oEmbed -> thumbnail_url
-        if (pageURL.host?.contains("youtube.com") == true) || (pageURL.host?.contains("youtu.be") == true) {
-            if let imageURL = await oEmbedThumbnailURL(provider: "youtube", pageURL: pageURL),
                let img = await downloadImage(imageURL) {
                 return img
             }
@@ -520,11 +802,13 @@ struct NotchApp: App {
 }
 
 class PassThroughView<Content: View>: NSHostingView<Content> {
+    var allowsHitTesting: Bool = false
+
     override func hitTest(_ point: NSPoint) -> NSView? {
         // We never want to actually absorb clicks, so if the user clicks, just pass it through 
         // to whatever app is underneath the notch (like the Menu Bar).
         // Returning nil here drops the click entirely, while tracking areas (like .onHover) continue to function.
-        return nil
+        return allowsHitTesting ? super.hitTest(point) : nil
     }
 }
 
@@ -539,8 +823,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let notchWidth: CGFloat = 330
         let notchHeight: CGFloat = 34
         
-        let expandedWidth: CGFloat = 360
-        let expandedHeight: CGFloat = 90
+        let expandedWidth: CGFloat = 400
+        let expandedHeight: CGFloat = 120
         
         // The *window* needs to be large enough to contain the *expanded* notch, even when it's small.
         // Otherwise, the notch will clip when it animates open.
@@ -554,8 +838,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         
         // NotchView needs to know how big the window is so it can align itself 
         // to the absolute top-center of the Invisible Box.
-        let notchView = NotchView(baseWidth: notchWidth, baseHeight: notchHeight, expandedWidth: expandedWidth, expandedHeight: expandedHeight)
-        let hostingView = PassThroughView(rootView: notchView)
+        var hostingView: PassThroughView<NotchView>!
+        let notchView = NotchView(
+            baseWidth: notchWidth,
+            baseHeight: notchHeight,
+            expandedWidth: expandedWidth,
+            expandedHeight: expandedHeight
+        ) { hovering in
+            hostingView?.allowsHitTesting = hovering
+        }
+        hostingView = PassThroughView(rootView: notchView)
         hostingView.frame = NSRect(origin: .zero, size: windowRect.size)
 
         notchWindow = NSWindow(
@@ -636,18 +928,24 @@ struct NotchView: View {
     let baseHeight: CGFloat
     let expandedWidth: CGFloat
     let expandedHeight: CGFloat
+    let onHoverChange: (Bool) -> Void
     
     @StateObject private var batteryManager = BatteryManager()
     @StateObject private var nowPlayingManager = NowPlayingManager()
     @State private var activeAppIcon: NSImage?
+    @State private var activeAppName: String?
+    @State private var activeAppBundleID: String?
     @State private var isHovered = false
     @State private var appActivationObserver: NSObjectProtocol?
     
     private func updateActiveAppIcon() {
-        let icon = NSWorkspace.shared.frontmostApplication?.icon?.withMinimalistColors()
+        let app = NSWorkspace.shared.frontmostApplication
+        let icon = app?.icon?.withMinimalistColors()
         // Defer to next runloop to avoid AttributeGraph cycles during layout/updates.
         DispatchQueue.main.async {
             self.activeAppIcon = icon
+            self.activeAppName = app?.localizedName
+            self.activeAppBundleID = app?.bundleIdentifier
         }
     }
     
@@ -673,6 +971,362 @@ struct NotchView: View {
             return .white
         }
     }
+
+    private var miniPlayerTitle: String {
+        let recent = Date().timeIntervalSince(nowPlayingManager.lastTrackUpdateAt) < 5.0
+        if let title = nowPlayingManager.trackTitle,
+           !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return title
+        }
+        if recent, let cached = nowPlayingManager.cachedTrackTitle,
+           !cached.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return cached
+        }
+        if let appName = nowPlayingManager.nowPlayingAppName,
+           !appName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return appName
+        }
+        return nowPlayingManager.isPlaying ? "Now Playing" : "Nothing Playing"
+    }
+
+    private var miniPlayerSubtitle: String {
+        let recent = Date().timeIntervalSince(nowPlayingManager.lastTrackUpdateAt) < 5.0
+        if let artist = nowPlayingManager.trackArtist,
+           !artist.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return artist
+        }
+        if recent, let cached = nowPlayingManager.cachedTrackArtist,
+           !cached.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return cached
+        }
+        if let album = nowPlayingManager.trackAlbum,
+           !album.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return album
+        }
+        if recent, let cached = nowPlayingManager.cachedTrackAlbum,
+           !cached.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return cached
+        }
+        return nowPlayingManager.isPlaying ? "Audio source" : "Hover to play something"
+    }
+
+    private var miniPlayerArt: some View {
+        Group {
+            let recentArt = Date().timeIntervalSince(nowPlayingManager.lastArtworkUpdateAt) < 6.0
+            let art = nowPlayingManager.nowPlayingArtwork ?? (recentArt ? nowPlayingManager.cachedArtwork : nil)
+            if let image = art ?? nowPlayingManager.nowPlayingAppIcon ?? activeAppIcon {
+                Image(nsImage: image)
+                    .resizable()
+                    .scaledToFill()
+            } else {
+                Image(systemName: "music.note")
+                    .resizable()
+                    .scaledToFit()
+                    .padding(6)
+                    .foregroundColor(.white.opacity(0.7))
+            }
+        }
+        .frame(width: 30, height: 30)
+        .background(Color.white.opacity(0.08))
+        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .stroke(Color.white.opacity(0.08), lineWidth: 1)
+        )
+    }
+
+    private func sendMediaKey(_ key: Int32) {
+        // System-defined media key events (private but widely used).
+        let flags = NSEvent.ModifierFlags(rawValue: 0xA00)
+        let keyDown = Int((key << 16) | 0xA00)
+        let keyUp = Int((key << 16) | 0xB00)
+
+        let down = NSEvent.otherEvent(
+            with: .systemDefined,
+            location: .zero,
+            modifierFlags: flags,
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            subtype: 8,
+            data1: keyDown,
+            data2: -1
+        )
+        let up = NSEvent.otherEvent(
+            with: .systemDefined,
+            location: .zero,
+            modifierFlags: flags,
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            subtype: 8,
+            data1: keyUp,
+            data2: -1
+        )
+
+        down?.cgEvent?.post(tap: .cghidEventTap)
+        up?.cgEvent?.post(tap: .cghidEventTap)
+    }
+
+    private enum PlaybackCommand {
+        case playPause
+        case next
+        case previous
+    }
+
+    private func runAppleScript(_ script: String, language: String = "AppleScript") -> Bool {
+        let proc = Process()
+        proc.launchPath = "/usr/bin/osascript"
+        if language == "JavaScript" {
+            proc.arguments = ["-l", "JavaScript", "-e", script]
+        } else {
+            proc.arguments = ["-e", script]
+        }
+        proc.standardOutput = Pipe()
+        proc.standardError = Pipe()
+        do {
+            try proc.run()
+        } catch {
+            return false
+        }
+        proc.waitUntilExit()
+        return proc.terminationStatus == 0
+    }
+
+    private func sendPlaybackCommand(_ command: PlaybackCommand) {
+        let appName = nowPlayingManager.nowPlayingAppName?.lowercased() ?? ""
+        let fallback = nowPlayingManager.lastControllableSource ?? ""
+        var handled = false
+
+        if appName.contains("spotify") {
+            let script: String
+            switch command {
+            case .playPause: script = "tell application \"Spotify\" to playpause"
+            case .next: script = "tell application \"Spotify\" to next track"
+            case .previous: script = "tell application \"Spotify\" to previous track"
+            }
+            handled = runAppleScript(script)
+        } else if appName == "music" {
+            let script: String
+            switch command {
+            case .playPause: script = "tell application \"Music\" to playpause"
+            case .next: script = "tell application \"Music\" to next track"
+            case .previous: script = "tell application \"Music\" to previous track"
+            }
+            handled = runAppleScript(script)
+        } else if appName.contains("vox") {
+            let script: String
+            switch command {
+            case .playPause:
+                script = "const vox = Application(\"Vox\"); try { vox.playpause(); } catch (e) {}"
+            case .next:
+                script = "const vox = Application(\"Vox\"); try { vox.next(); } catch (e) {}"
+            case .previous:
+                script = "const vox = Application(\"Vox\"); try { vox.previous(); } catch (e) {}"
+            }
+            handled = runAppleScript(script, language: "JavaScript")
+        } else if appName.contains("brave") || fallback == "brave-spotify" {
+            handled = runBraveSpotifyCommand(command)
+        } else if fallback == "spotify" {
+            let script: String
+            switch command {
+            case .playPause: script = "tell application \"Spotify\" to playpause"
+            case .next: script = "tell application \"Spotify\" to next track"
+            case .previous: script = "tell application \"Spotify\" to previous track"
+            }
+            handled = runAppleScript(script)
+        } else if fallback == "music" {
+            let script: String
+            switch command {
+            case .playPause: script = "tell application \"Music\" to playpause"
+            case .next: script = "tell application \"Music\" to next track"
+            case .previous: script = "tell application \"Music\" to previous track"
+            }
+            handled = runAppleScript(script)
+        } else if fallback == "vox" {
+            let script: String
+            switch command {
+            case .playPause:
+                script = "const vox = Application(\"Vox\"); try { vox.playpause(); } catch (e) {}"
+            case .next:
+                script = "const vox = Application(\"Vox\"); try { vox.next(); } catch (e) {}"
+            case .previous:
+                script = "const vox = Application(\"Vox\"); try { vox.previous(); } catch (e) {}"
+            }
+            handled = runAppleScript(script, language: "JavaScript")
+        }
+
+        if handled {
+            return
+        }
+
+        switch command {
+        case .playPause:
+            sendMediaKey(16) // NX_KEYTYPE_PLAY (toggle play/pause)
+        case .next:
+            sendMediaKey(17) // NX_KEYTYPE_NEXT
+        case .previous:
+            sendMediaKey(18) // NX_KEYTYPE_PREVIOUS
+        }
+    }
+
+    private func runBraveSpotifyCommand(_ command: PlaybackCommand) -> Bool {
+        let js: String
+        switch command {
+        case .playPause:
+            js = """
+            (function(){
+              const play = document.querySelector('[data-testid="control-button-playpause"]') ||
+                           document.querySelector('button[aria-label="Play"]') ||
+                           document.querySelector('button[aria-label="Pause"]');
+              if (play) { play.click(); return true; }
+              return false;
+            })();
+            """
+        case .next:
+            js = """
+            (function(){
+              const next = document.querySelector('[data-testid="control-button-skip-forward"]') ||
+                           document.querySelector('button[aria-label="Next"]') ||
+                           document.querySelector('button[aria-label="Next track"]');
+              if (next) { next.click(); return true; }
+              return false;
+            })();
+            """
+        case .previous:
+            js = """
+            (function(){
+              const prev = document.querySelector('[data-testid="control-button-skip-back"]') ||
+                           document.querySelector('button[aria-label="Previous"]') ||
+                           document.querySelector('button[aria-label="Previous track"]');
+              if (prev) { prev.click(); return true; }
+              return false;
+            })();
+            """
+        }
+
+        let escapedJS = js.replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+            .replacingOccurrences(of: "\n", with: " ")
+
+        let script = """
+        tell application "Brave Browser"
+            if (count of windows) = 0 then return false
+            set theTab to active tab of front window
+            set result to execute javascript "\(escapedJS)" in theTab
+        end tell
+        """
+        return runAppleScript(script)
+    }
+
+    private var miniPlayerControls: some View {
+        HStack(spacing: 12) {
+            Button {
+                sendPlaybackCommand(.previous)
+            } label: {
+                Image(systemName: "backward.fill")
+                    .font(.system(size: 11, weight: .semibold))
+            }
+
+            Button {
+                sendPlaybackCommand(.playPause)
+            } label: {
+                Image(systemName: nowPlayingManager.isPlaying ? "pause.fill" : "play.fill")
+                    .font(.system(size: 12, weight: .semibold))
+            }
+
+            Button {
+                sendPlaybackCommand(.next)
+            } label: {
+                Image(systemName: "forward.fill")
+                    .font(.system(size: 11, weight: .semibold))
+            }
+        }
+        .buttonStyle(.plain)
+        .foregroundColor(.white.opacity(0.9))
+    }
+
+    private var miniPlayerPanel: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .center, spacing: 8) {
+                miniPlayerArt
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(miniPlayerTitle)
+                        .font(.system(size: 10, weight: .semibold, design: .rounded))
+                        .foregroundColor(.white)
+                        .lineLimit(1)
+
+                    HStack(spacing: 4) {
+                        Image(systemName: nowPlayingManager.isPlaying ? "speaker.wave.2.fill" : "speaker.slash.fill")
+                            .font(.system(size: 8, weight: .regular))
+                            .foregroundColor(.white.opacity(0.7))
+                        Text(miniPlayerSubtitle)
+                            .font(.system(size: 9, weight: .regular, design: .rounded))
+                            .foregroundColor(.white.opacity(0.7))
+                            .lineLimit(1)
+                    }
+                }
+            }
+
+            miniPlayerControls
+        }
+        .padding(.vertical, 6)
+        .padding(.horizontal, 8)
+        .background(Color.white.opacity(0.06))
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .frame(maxWidth: 230, alignment: .leading)
+    }
+
+    private var browserPermissionPanel: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Enable Spotify in browser")
+                .font(.system(size: 10, weight: .semibold, design: .rounded))
+                .foregroundColor(.white)
+                .lineLimit(1)
+
+            Text("Allow Notch to read the active tab.")
+                .font(.system(size: 9, weight: .regular, design: .rounded))
+                .foregroundColor(.white.opacity(0.7))
+                .lineLimit(1)
+
+            Button {
+                nowPlayingManager.requestBrowserPermissionIfNeeded()
+            } label: {
+                Text("Enable")
+                    .font(.system(size: 10, weight: .semibold, design: .rounded))
+                    .padding(.vertical, 4)
+                    .padding(.horizontal, 10)
+                    .background(Color.white.opacity(0.12))
+                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+            }
+            .buttonStyle(.plain)
+            .foregroundColor(.white)
+        }
+        .padding(.vertical, 6)
+        .padding(.horizontal, 8)
+        .background(Color.white.opacity(0.06))
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .frame(maxWidth: 230, alignment: .leading)
+    }
+
+    private var appIconView: some View {
+        Group {
+            if let image = nowPlayingManager.nowPlayingAppIcon ?? activeAppIcon {
+                Image(nsImage: image)
+                    .resizable()
+                    .scaledToFit()
+            }
+        }
+        .frame(width: 20, height: 20, alignment: .center)
+    }
+
+    private var isFrontmostBrowser: Bool {
+        let id = activeAppBundleID?.lowercased() ?? ""
+        let n = activeAppName?.lowercased() ?? ""
+        return id.contains("brave") || id.contains("chrome") || id.contains("edge") || id.contains("safari") || id.contains("arc")
+            || n.contains("brave") || n.contains("chrome") || n.contains("edge") || n.contains("safari") || n.contains("arc")
+    }
     
     var body: some View {
         // We place the expanding notch inside an invisible frame the exact size of the maximum window.
@@ -693,14 +1347,19 @@ struct NotchView: View {
                         HStack(alignment: .top) {
                             // Left: Active app icon
                             Group {
-                                // If any app is actively playing audio, prefer that app's icon.
-                                if let image = nowPlayingManager.nowPlayingArtwork ?? nowPlayingManager.nowPlayingAppIcon ?? activeAppIcon {
-                                    Image(nsImage: image)
-                                        .resizable()
-                                        .scaledToFit()
+                                if isHovered {
+                                    VStack(alignment: .leading, spacing: 6) {
+                                        appIconView
+                                        miniPlayerPanel
+                                        let recentlyRequested = Date().timeIntervalSince(nowPlayingManager.lastPermissionRequestAt) < 10.0
+                                        if (nowPlayingManager.isBrowserSource || isFrontmostBrowser || recentlyRequested) && !nowPlayingManager.isEligibleSource {
+                                            browserPermissionPanel
+                                        }
+                                    }
+                                } else {
+                                    appIconView
                                 }
                             }
-                            .frame(width: 20, height: 20, alignment: .center)
                             .padding(.top, 6)
                             
                             Spacer(minLength: 0)
@@ -736,6 +1395,10 @@ struct NotchView: View {
             // Trigger the animation whenever the mouse enters/leaves this specific shape
             .onHover { hovering in
                 isHovered = hovering
+                onHoverChange(hovering)
+                if hovering && isFrontmostBrowser {
+                    nowPlayingManager.requestBrowserPermissionIfNeeded()
+                }
             }
             .animation(.spring(response: 0.35, dampingFraction: 0.65), value: isHovered)
             
