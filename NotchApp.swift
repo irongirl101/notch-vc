@@ -1,5 +1,30 @@
 import Cocoa
 import SwiftUI
+import CoreImage
+
+extension NSImage {
+    func grayscaled() -> NSImage {
+        guard let tiffData = self.tiffRepresentation,
+              let bitmapImage = NSBitmapImageRep(data: tiffData),
+              let ciImage = CIImage(bitmapImageRep: bitmapImage) else {
+            return self
+        }
+        
+        guard let filter = CIFilter(name: "CIColorControls") else { return self }
+        filter.setValue(ciImage, forKey: kCIInputImageKey)
+        filter.setValue(0.0, forKey: kCIInputSaturationKey) // Zero saturation = B&W
+        filter.setValue(0.3, forKey: kCIInputBrightnessKey) // Increase brightness
+        filter.setValue(1.3, forKey: kCIInputContrastKey)   // Increase contrast to prevent washing out
+        
+        guard let outputCIImage = filter.outputImage else { return self }
+        
+        let context = CIContext(options: nil)
+        if let cgImage = context.createCGImage(outputCIImage, from: outputCIImage.extent) {
+            return NSImage(cgImage: cgImage, size: self.size)
+        }
+        return self
+    }
+}
 
 @main
 struct NotchApp: App {
@@ -20,8 +45,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         
         // Since the user already has a physical MacBook notch, our software notch needs to be wider 
         // to extend past it and show the battery text on the side. 
-        // A physical 14"/16" notch is ~200-220pt wide. Let's make ours ~360pt wide.
-        let notchWidth: CGFloat = 360
+        // A physical 14"/16" notch is ~200-220pt wide. Let's make ours ~290pt wide.
+        let notchWidth: CGFloat = 290
         let notchHeight: CGFloat = 34
         
         // Position at the top center of the screen
@@ -53,6 +78,25 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         
         notchWindow.contentView = hostingView
         notchWindow.makeKeyAndOrderFront(nil)
+        
+        // Native AppKit active app icon overlay to bypass SwiftUI cycles
+        let iconView = NSImageView(frame: NSRect(x: notchWidth - 32, y: 7, width: 20, height: 20))
+        iconView.imageScaling = .scaleProportionallyUpOrDown
+        if let contentView = notchWindow.contentView {
+            contentView.addSubview(iconView)
+        }
+        
+        // Initial setup
+        if let app = NSWorkspace.shared.frontmostApplication {
+            iconView.image = app.icon?.grayscaled()
+        }
+        
+        // Observe changes
+        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { _ in
+            if let app = NSWorkspace.shared.frontmostApplication {
+                iconView.image = app.icon?.grayscaled()
+            }
+        }
     }
 }
 
@@ -131,27 +175,29 @@ struct NotchView: View {
     }
     
     var body: some View {
-        ZStack(alignment: .trailing) {
-            // A black rectangle with rounded bottom corners
-            NotchShape()
-                .fill(Color.black)
-                .ignoresSafeArea()
-            
-            HStack(spacing: 5) {
-                Text(batteryManager.percentage)
-                    .font(.system(size: 14, weight: .bold, design: .rounded))
-                    .foregroundColor(.white)
-                
-                Image(systemName: batteryIconName(level: batteryManager.batteryLevel, isCharging: batteryManager.isCharging))
-                    .font(.system(size: 14, weight: .regular))
-                    .foregroundColor(batteryColor(level: batteryManager.batteryLevel, 
-                                                  isCharging: batteryManager.isCharging, 
-                                                  isLowPower: batteryManager.isLowPowerMode))
-            }
-            .padding(.trailing, 16)
-            // Offset vertically to perfectly center the text within the 34px bounds
+        NotchShape()
+            .fill(Color.black)
+            .ignoresSafeArea()
+            .frame(width: 290, height: 34)
+            .overlay(
+                // Left Side: Battery
+                ZStack(alignment: .center) {
+                    Image(systemName: batteryIconName(level: batteryManager.batteryLevel, isCharging: batteryManager.isCharging))
+                        .font(.system(size: 24, weight: .light)) // Make battery outline larger
+                        .foregroundColor(batteryColor(level: batteryManager.batteryLevel, 
+                                                      isCharging: batteryManager.isCharging, 
+                                                      isLowPower: batteryManager.isLowPowerMode))
+                    
+                    // Drop the '%' sign to properly fit inside the SF Symbol boundary
+                    Text("\(batteryManager.batteryLevel)")
+                        .font(.system(size: 10, weight: .bold, design: .rounded))
+                        .foregroundColor(batteryManager.batteryLevel <= 20 && !batteryManager.isCharging ? .white : .black)
+                        // Nudge it slightly left to avoid bumping the battery terminal nub
+                        .padding(.trailing, 2)
+                }
+                .position(x: 28, y: 15) // Absolute positioning
+            )
             .offset(y: 1)
-        }
     }
 }
 
