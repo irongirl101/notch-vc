@@ -95,41 +95,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         
         notchWindow.contentView = hostingView
         notchWindow.makeKeyAndOrderFront(nil)
-        
-        // Native AppKit active app icon overlay to bypass SwiftUI cycles
-        let iconView = NSImageView(frame: NSRect(x: expandedWidth - 32 - ((expandedWidth - notchWidth)/2), y: expandedHeight - 25, width: 20, height: 20))
-        iconView.imageScaling = .scaleProportionallyUpOrDown
-        if let contentView = notchWindow.contentView {
-            contentView.addSubview(iconView)
-        }
-        
-        // Initial setup
-        if let app = NSWorkspace.shared.frontmostApplication {
-            iconView.image = app.icon?.withMinimalistColors()
-        }
-        
-        // Observe changes
-        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { _ in
-            if let app = NSWorkspace.shared.frontmostApplication {
-                iconView.image = app.icon?.withMinimalistColors()
-            }
-        }
-        
-        // Listen for SwiftUI expansion events to move the AppKit icon in sync
-        NotificationCenter.default.addObserver(forName: Notification.Name("NotchHoverChanged"), object: nil, queue: .main) { notification in
-            if let isHovered = notification.userInfo?["isHovered"] as? Bool {
-                NSAnimationContext.runAnimationGroup { context in
-                    context.duration = 0.35
-                    context.timingFunction = CAMediaTimingFunction(controlPoints: 0.5, 1.5, 0.5, 1.0) // Spring approx
-                    if isHovered {
-                        iconView.animator().setFrameOrigin(NSPoint(x: expandedWidth - 43, y: expandedHeight - 25)) // Perfectly aligned with battery Y (15 from top)
-                    } else {
-                        // Base position
-                        iconView.animator().setFrameOrigin(NSPoint(x: expandedWidth - 32 - ((expandedWidth - notchWidth)/2), y: expandedHeight - 25)) // Perfectly aligned with battery Y (15 from top)
-                    }
-                }
-            }
-        }
     }
 }
 
@@ -142,7 +107,10 @@ class BatteryManager: ObservableObject {
 
     init() {
         self.isLowPowerMode = ProcessInfo.processInfo.isLowPowerModeEnabled
-        updateBattery()
+        // Defer the first read to avoid SwiftUI/AttributeGraph update cycles during view creation.
+        DispatchQueue.main.async { [weak self] in
+            self?.updateBattery()
+        }
         
         // Instantly catch when the user shifts in and out of Low Power Mode
         NotificationCenter.default.addObserver(forName: Notification.Name.NSProcessInfoPowerStateDidChange, object: nil, queue: .main) { [weak self] _ in
@@ -188,7 +156,17 @@ struct NotchView: View {
     let expandedHeight: CGFloat
     
     @StateObject private var batteryManager = BatteryManager()
+    @State private var activeAppIcon: NSImage?
     @State private var isHovered = false
+    @State private var appActivationObserver: NSObjectProtocol?
+    
+    private func updateActiveAppIcon() {
+        let icon = NSWorkspace.shared.frontmostApplication?.icon?.withMinimalistColors()
+        // Defer to next runloop to avoid AttributeGraph cycles during layout/updates.
+        DispatchQueue.main.async {
+            self.activeAppIcon = icon
+        }
+    }
     
     private func batteryIconName(level: Int, isCharging: Bool) -> String {
         let suffix = isCharging ? ".bolt" : ""
@@ -228,35 +206,75 @@ struct NotchView: View {
                         height: isHovered ? expandedHeight : baseHeight
                     )
                     .overlay(
-                        // Left Side: Battery
-                        ZStack(alignment: .center) {
-                            Image(systemName: batteryIconName(level: batteryManager.batteryLevel, isCharging: batteryManager.isCharging))
-                                .font(.system(size: 24, weight: .light)) // Make battery outline larger
-                                .foregroundColor(batteryColor(level: batteryManager.batteryLevel, 
-                                                              isCharging: batteryManager.isCharging, 
-                                                              isLowPower: batteryManager.isLowPowerMode))
+                        // Use edge-aligned layout (avoids layout cycles from .position())
+                        HStack(alignment: .top) {
+                            // Left: Battery
+                            ZStack(alignment: .center) {
+                                Image(systemName: batteryIconName(level: batteryManager.batteryLevel, isCharging: batteryManager.isCharging))
+                                    .font(.system(size: 24, weight: .light))
+                                    .foregroundColor(batteryColor(level: batteryManager.batteryLevel,
+                                                                  isCharging: batteryManager.isCharging,
+                                                                  isLowPower: batteryManager.isLowPowerMode))
+                                
+                                Text("\(batteryManager.batteryLevel)")
+                                    .font(.system(size: 10, weight: .bold, design: .rounded))
+                                    .foregroundColor(batteryManager.batteryLevel <= 20 && !batteryManager.isCharging ? .white : .black)
+                                    .padding(.trailing, 2)
+                            }
+                            .frame(width: 28, height: 28, alignment: .center)
                             
-                            // Drop the '%' sign to properly fit inside the SF Symbol boundary
-                            Text("\(batteryManager.batteryLevel)")
-                                .font(.system(size: 10, weight: .bold, design: .rounded))
-                                .foregroundColor(batteryManager.batteryLevel <= 20 && !batteryManager.isCharging ? .white : .black)
-                                // Nudge it slightly left to avoid bumping the battery terminal nub
-                                .padding(.trailing, 2)
+                            Spacer(minLength: 0)
+                            
+                            // Right: Active app icon
+                            Group {
+                                if let icon = activeAppIcon {
+                                    Image(nsImage: icon)
+                                        .resizable()
+                                        .scaledToFit()
+                                }
+                            }
+                            .frame(width: 20, height: 20, alignment: .center)
+                            .padding(.top, 6)
                         }
-                        // Adjust X slightly inward when expanded to account for the wider 320px frame
-                        .position(x: isHovered ? 43 : 28, y: 15) 
+                        // These paddings are tuned to sit inside the notch "corner" area.
+                        .padding(.top, 1)
+                        .padding(.leading, isHovered ? 29 : 14)
+                        .padding(.trailing, isHovered ? 29 : 14)
+                        .frame(
+                            width: isHovered ? expandedWidth : baseWidth,
+                            height: isHovered ? expandedHeight : baseHeight,
+                            alignment: .top
+                        )
                     )
             }
             .offset(y: 1)
             // Trigger the animation whenever the mouse enters/leaves this specific shape
             .onHover { hovering in
                 isHovered = hovering
-                NotificationCenter.default.post(name: Notification.Name("NotchHoverChanged"), object: nil, userInfo: ["isHovered": hovering])
             }
             .animation(.spring(response: 0.35, dampingFraction: 0.65), value: isHovered)
             
         }
         .frame(width: expandedWidth, height: expandedHeight, alignment: .top)
+        .onAppear {
+            // Ensure we only register once for this view lifetime.
+            if appActivationObserver == nil {
+                updateActiveAppIcon()
+                appActivationObserver = NSWorkspace.shared.notificationCenter.addObserver(
+                    forName: NSWorkspace.didActivateApplicationNotification,
+                    object: nil,
+                    queue: .main
+                ) { _ in
+                    updateActiveAppIcon()
+                }
+            }
+        }
+        .onDisappear {
+            if let appActivationObserver {
+                NSWorkspace.shared.notificationCenter.removeObserver(appActivationObserver)
+                self.appActivationObserver = nil
+            }
+        }
     }
 }
 
