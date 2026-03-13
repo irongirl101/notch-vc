@@ -3,7 +3,7 @@ import SwiftUI
 import CoreImage
 
 extension NSImage {
-    func grayscaled() -> NSImage {
+    func withMinimalistColors() -> NSImage {
         guard let tiffData = self.tiffRepresentation,
               let bitmapImage = NSBitmapImageRep(data: tiffData),
               let ciImage = CIImage(bitmapImageRep: bitmapImage) else {
@@ -12,9 +12,9 @@ extension NSImage {
         
         guard let filter = CIFilter(name: "CIColorControls") else { return self }
         filter.setValue(ciImage, forKey: kCIInputImageKey)
-        filter.setValue(0.0, forKey: kCIInputSaturationKey) // Zero saturation = B&W
-        filter.setValue(0.3, forKey: kCIInputBrightnessKey) // Increase brightness
-        filter.setValue(1.3, forKey: kCIInputContrastKey)   // Increase contrast to prevent washing out
+        filter.setValue(0.4, forKey: kCIInputSaturationKey) // Muted saturation for a minimalist look
+        filter.setValue(0.1, forKey: kCIInputBrightnessKey) // Slight brightness boost
+        filter.setValue(1.1, forKey: kCIInputContrastKey)   // Slight contrast boost to keep it crisp
         
         guard let outputCIImage = filter.outputImage else { return self }
         
@@ -37,6 +37,15 @@ struct NotchApp: App {
     }
 }
 
+class PassThroughView<Content: View>: NSHostingView<Content> {
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        // We never want to actually absorb clicks, so if the user clicks, just pass it through 
+        // to whatever app is underneath the notch (like the Menu Bar).
+        // Returning nil here drops the click entirely, while tracking areas (like .onHover) continue to function.
+        return nil
+    }
+}
+
 class AppDelegate: NSObject, NSApplicationDelegate {
     var notchWindow: NSWindow!
 
@@ -45,26 +54,30 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         
         // Since the user already has a physical MacBook notch, our software notch needs to be wider 
         // to extend past it and show the battery text on the side. 
-        // A physical 14"/16" notch is ~200-220pt wide. Let's make ours ~290pt wide.
         let notchWidth: CGFloat = 290
         let notchHeight: CGFloat = 34
         
-        // Position at the top center of the screen
-        // We add +1 to screenRect.height to nudge the software notch up higher so it overlaps tightly 
-        // with the physical hardware bezel and doesn't visually "hang down" too far.
-        let notchRect = NSRect(
-            x: (screenRect.width - notchWidth) / 2.0,
-            y: screenRect.height - notchHeight + 1,
-            width: notchWidth,
-            height: notchHeight
+        let expandedWidth: CGFloat = 320
+        let expandedHeight: CGFloat = 90
+        
+        // The *window* needs to be large enough to contain the *expanded* notch, even when it's small.
+        // Otherwise, the notch will clip when it animates open.
+        // We position this invisible bounding box at the top center.
+        let windowRect = NSRect(
+            x: (screenRect.width - expandedWidth) / 2.0,
+            y: screenRect.height - expandedHeight + 1, // Still push it up +1 to hide the top edge
+            width: expandedWidth,
+            height: expandedHeight
         )
         
-        let notchView = NotchView()
-        let hostingView = NSHostingView(rootView: notchView)
-        hostingView.frame = NSRect(origin: .zero, size: notchRect.size)
+        // NotchView needs to know how big the window is so it can align itself 
+        // to the absolute top-center of the Invisible Box.
+        let notchView = NotchView(baseWidth: notchWidth, baseHeight: notchHeight, expandedWidth: expandedWidth, expandedHeight: expandedHeight)
+        let hostingView = PassThroughView(rootView: notchView)
+        hostingView.frame = NSRect(origin: .zero, size: windowRect.size)
 
         notchWindow = NSWindow(
-            contentRect: notchRect,
+            contentRect: windowRect,
             styleMask: [.borderless],
             backing: .buffered,
             defer: false
@@ -73,14 +86,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         notchWindow.isOpaque = false
         notchWindow.backgroundColor = .clear
         notchWindow.level = .statusBar // Place above the menu bar
-        notchWindow.ignoresMouseEvents = true // Disable interactions so the user can use the menu underneath
+        notchWindow.hasShadow = false
+        // DO NOT set ignoresMouseEvents = true. We need tracking areas for hover!
         notchWindow.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle] // Appear on all spaces
+        
+        // Set standard tracking areas so SwiftUI .onHover works
+        notchWindow.acceptsMouseMovedEvents = true
         
         notchWindow.contentView = hostingView
         notchWindow.makeKeyAndOrderFront(nil)
         
         // Native AppKit active app icon overlay to bypass SwiftUI cycles
-        let iconView = NSImageView(frame: NSRect(x: notchWidth - 32, y: 7, width: 20, height: 20))
+        let iconView = NSImageView(frame: NSRect(x: expandedWidth - 32 - ((expandedWidth - notchWidth)/2), y: expandedHeight - 25, width: 20, height: 20))
         iconView.imageScaling = .scaleProportionallyUpOrDown
         if let contentView = notchWindow.contentView {
             contentView.addSubview(iconView)
@@ -88,13 +105,29 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         
         // Initial setup
         if let app = NSWorkspace.shared.frontmostApplication {
-            iconView.image = app.icon?.grayscaled()
+            iconView.image = app.icon?.withMinimalistColors()
         }
         
         // Observe changes
         NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { _ in
             if let app = NSWorkspace.shared.frontmostApplication {
-                iconView.image = app.icon?.grayscaled()
+                iconView.image = app.icon?.withMinimalistColors()
+            }
+        }
+        
+        // Listen for SwiftUI expansion events to move the AppKit icon in sync
+        NotificationCenter.default.addObserver(forName: Notification.Name("NotchHoverChanged"), object: nil, queue: .main) { notification in
+            if let isHovered = notification.userInfo?["isHovered"] as? Bool {
+                NSAnimationContext.runAnimationGroup { context in
+                    context.duration = 0.35
+                    context.timingFunction = CAMediaTimingFunction(controlPoints: 0.5, 1.5, 0.5, 1.0) // Spring approx
+                    if isHovered {
+                        iconView.animator().setFrameOrigin(NSPoint(x: expandedWidth - 43, y: expandedHeight - 25)) // Perfectly aligned with battery Y (15 from top)
+                    } else {
+                        // Base position
+                        iconView.animator().setFrameOrigin(NSPoint(x: expandedWidth - 32 - ((expandedWidth - notchWidth)/2), y: expandedHeight - 25)) // Perfectly aligned with battery Y (15 from top)
+                    }
+                }
             }
         }
     }
@@ -149,7 +182,13 @@ class BatteryManager: ObservableObject {
 }
 
 struct NotchView: View {
+    let baseWidth: CGFloat
+    let baseHeight: CGFloat
+    let expandedWidth: CGFloat
+    let expandedHeight: CGFloat
+    
     @StateObject private var batteryManager = BatteryManager()
+    @State private var isHovered = false
     
     private func batteryIconName(level: Int, isCharging: Bool) -> String {
         let suffix = isCharging ? ".bolt" : ""
@@ -175,29 +214,49 @@ struct NotchView: View {
     }
     
     var body: some View {
-        NotchShape()
-            .fill(Color.black)
-            .ignoresSafeArea()
-            .frame(width: 290, height: 34)
-            .overlay(
-                // Left Side: Battery
-                ZStack(alignment: .center) {
-                    Image(systemName: batteryIconName(level: batteryManager.batteryLevel, isCharging: batteryManager.isCharging))
-                        .font(.system(size: 24, weight: .light)) // Make battery outline larger
-                        .foregroundColor(batteryColor(level: batteryManager.batteryLevel, 
-                                                      isCharging: batteryManager.isCharging, 
-                                                      isLowPower: batteryManager.isLowPowerMode))
-                    
-                    // Drop the '%' sign to properly fit inside the SF Symbol boundary
-                    Text("\(batteryManager.batteryLevel)")
-                        .font(.system(size: 10, weight: .bold, design: .rounded))
-                        .foregroundColor(batteryManager.batteryLevel <= 20 && !batteryManager.isCharging ? .white : .black)
-                        // Nudge it slightly left to avoid bumping the battery terminal nub
-                        .padding(.trailing, 2)
-                }
-                .position(x: 28, y: 15) // Absolute positioning
-            )
+        // We place the expanding notch inside an invisible frame the exact size of the maximum window.
+        // We align it to the top so it "drops down" strictly from the menu bar edge.
+        ZStack(alignment: .top) {
+            
+            // The expanding black notch area
+            Group {
+                NotchShape()
+                    .fill(Color.black)
+                    .ignoresSafeArea()
+                    .frame(
+                        width: isHovered ? expandedWidth : baseWidth, 
+                        height: isHovered ? expandedHeight : baseHeight
+                    )
+                    .overlay(
+                        // Left Side: Battery
+                        ZStack(alignment: .center) {
+                            Image(systemName: batteryIconName(level: batteryManager.batteryLevel, isCharging: batteryManager.isCharging))
+                                .font(.system(size: 24, weight: .light)) // Make battery outline larger
+                                .foregroundColor(batteryColor(level: batteryManager.batteryLevel, 
+                                                              isCharging: batteryManager.isCharging, 
+                                                              isLowPower: batteryManager.isLowPowerMode))
+                            
+                            // Drop the '%' sign to properly fit inside the SF Symbol boundary
+                            Text("\(batteryManager.batteryLevel)")
+                                .font(.system(size: 10, weight: .bold, design: .rounded))
+                                .foregroundColor(batteryManager.batteryLevel <= 20 && !batteryManager.isCharging ? .white : .black)
+                                // Nudge it slightly left to avoid bumping the battery terminal nub
+                                .padding(.trailing, 2)
+                        }
+                        // Adjust X slightly inward when expanded to account for the wider 320px frame
+                        .position(x: isHovered ? 43 : 28, y: 15) 
+                    )
+            }
             .offset(y: 1)
+            // Trigger the animation whenever the mouse enters/leaves this specific shape
+            .onHover { hovering in
+                isHovered = hovering
+                NotificationCenter.default.post(name: Notification.Name("NotchHoverChanged"), object: nil, userInfo: ["isHovered": hovering])
+            }
+            .animation(.spring(response: 0.35, dampingFraction: 0.65), value: isHovered)
+            
+        }
+        .frame(width: expandedWidth, height: expandedHeight, alignment: .top)
     }
 }
 
