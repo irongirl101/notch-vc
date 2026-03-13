@@ -536,10 +536,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         
         // Since the user already has a physical MacBook notch, our software notch needs to be wider 
         // to extend past it and show the battery text on the side. 
-        let notchWidth: CGFloat = 290
+        let notchWidth: CGFloat = 330
         let notchHeight: CGFloat = 34
         
-        let expandedWidth: CGFloat = 320
+        let expandedWidth: CGFloat = 360
         let expandedHeight: CGFloat = 90
         
         // The *window* needs to be large enough to contain the *expanded* notch, even when it's small.
@@ -706,19 +706,19 @@ struct NotchView: View {
                             Spacer(minLength: 0)
                             
                             // Right: Battery
-                            ZStack(alignment: .center) {
+                            HStack(alignment: .center, spacing: 4) {
+                                Text("\(batteryManager.batteryLevel)%")
+                                    .font(.system(size: 10, weight: .bold, design: .rounded))
+                                    .foregroundColor(.white)
+                                    .padding(.top, 1) // slight baseline adjustment
+                                
                                 Image(systemName: batteryIconName(level: batteryManager.batteryLevel, isCharging: batteryManager.isCharging))
-                                    .font(.system(size: 24, weight: .light))
+                                    .font(.system(size: 14, weight: .regular))
                                     .foregroundColor(batteryColor(level: batteryManager.batteryLevel,
                                                                   isCharging: batteryManager.isCharging,
                                                                   isLowPower: batteryManager.isLowPowerMode))
-                                
-                                Text("\(batteryManager.batteryLevel)")
-                                    .font(.system(size: 10, weight: .bold, design: .rounded))
-                                    .foregroundColor(batteryManager.batteryLevel <= 20 && !batteryManager.isCharging ? .white : .black)
-                                    .padding(.trailing, 2)
                             }
-                            .frame(width: 28, height: 28, alignment: .center)
+                            .frame(height: 28, alignment: .center)
                             .padding(.top, 2)
                         }
                         // These paddings are tuned to sit inside the notch "corner" area.
