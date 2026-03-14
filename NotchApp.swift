@@ -4,6 +4,7 @@ import CoreImage
 import CoreAudio
 import Foundation
 import AVFoundation
+import IOKit.ps
 
 extension NSImage {
     func withMinimalistColors() -> NSImage {
@@ -32,6 +33,7 @@ extension NSImage {
 final class NowPlayingManager: ObservableObject {
     @Published var isPlaying: Bool = false
     @Published var nowPlayingAppIcon: NSImage?
+    @Published var nowPlayingAppIconSmall: NSImage?
     @Published var nowPlayingArtwork: NSImage?
     @Published var trackTitle: String?
     @Published var trackArtist: String?
@@ -54,6 +56,11 @@ final class NowPlayingManager: ObservableObject {
     private var lastVoxTrackURL: String?
     private var lastVoxFetchAt: Date = .distantPast
     private var lastVoxFallbackKey: String?
+    private var lastVoxArtworkUpdateAt: Date = .distantPast
+    private var lastVoxTrackKey: String?
+    private var lastVoxPlayerState: Int = -1
+    private var lastVoxInfoAt: Date = .distantPast
+    private var lastVoxActiveAt: Date = .distantPast
     private var lastSourceBundleID: String?
     private var lastAudioSeenAt: Date = .distantPast
     @Published var lastTrackUpdateAt: Date = .distantPast
@@ -139,12 +146,21 @@ final class NowPlayingManager: ObservableObject {
 
                 guard playing else {
                     // Fall through to CoreAudio below (some systems report playing=false even when audio is active).
-                    self.nowPlayingArtwork = nil
-                    self.trackTitle = nil
-                    self.trackArtist = nil
-                    self.trackAlbum = nil
-                    self.isEligibleSource = false
-                    self.updateFromCoreAudio()
+                    if self.shouldPreserveVoxArtwork() {
+                        // Keep Vox metadata visible even when paused.
+                        self.isPlaying = (self.lastVoxPlayerState == 1)
+                        // Still poll Vox so metadata can update while paused.
+                        self.maybeUpdateArtworkFromVox()
+                        return
+                    } else {
+                        self.nowPlayingArtwork = nil
+                        self.cachedArtwork = nil
+                        self.trackTitle = nil
+                        self.trackArtist = nil
+                        self.trackAlbum = nil
+                        self.isEligibleSource = false
+                        self.updateFromCoreAudio()
+                    }
                     return
                 }
 
@@ -157,7 +173,11 @@ final class NowPlayingManager: ObservableObject {
                         self.cachedArtwork = image
                         self.lastArtworkUpdateAt = Date()
                     } else {
-                        self.nowPlayingArtwork = nil
+                        // Avoid wiping VOX artwork if MediaRemote has no art payload.
+                        let isVox = self.isVoxSource(bundleID: self.lastSourceBundleID, name: self.nowPlayingAppName)
+                        if !isVox {
+                            self.nowPlayingArtwork = nil
+                        }
                     }
 
                     let title = info["kMRMediaRemoteNowPlayingInfoTitle"] as? String
@@ -191,8 +211,16 @@ final class NowPlayingManager: ObservableObject {
                         self.updateFromCoreAudio()
                         return
                     }
-                    self.nowPlayingAppIcon = app.icon?.withMinimalistColors()
-                    self.nowPlayingAppName = app.localizedName
+                    let sourceChanged = app.bundleIdentifier != self.lastSourceBundleID
+                    if sourceChanged || self.nowPlayingAppIcon == nil {
+                        if let icon = app.icon?.withMinimalistColors() {
+                            self.nowPlayingAppIcon = icon
+                            self.nowPlayingAppIconSmall = Self.scaledImage(icon, size: CGSize(width: 20, height: 20))
+                        }
+                    }
+                    if sourceChanged || self.nowPlayingAppName == nil {
+                        self.nowPlayingAppName = app.localizedName
+                    }
                     self.lastSourceBundleID = app.bundleIdentifier
                     self.isEligibleSource = Self.isEligibleSource(bundleID: app.bundleIdentifier, name: app.localizedName)
                     self.isBrowserSource = Self.isBrowser(bundleID: app.bundleIdentifier, name: app.localizedName)
@@ -218,6 +246,19 @@ final class NowPlayingManager: ObservableObject {
         updateFromCoreAudio()
     }
 
+    private func isVoxSource(bundleID: String?, name: String?) -> Bool {
+        let n = name?.lowercased() ?? ""
+        if n.contains("vox") { return true }
+        if let id = bundleID, id.lowercased().contains("vox") { return true }
+        return false
+    }
+
+    private func shouldPreserveVoxArtwork() -> Bool {
+        let isVox = isVoxSource(bundleID: lastSourceBundleID, name: nowPlayingAppName)
+        let fresh = Date().timeIntervalSince(lastVoxActiveAt) < 60.0
+        return isVox && fresh
+    }
+
     private func updateFromCoreAudio() {
         if let pid = Self.currentlyRunningOutputPID(),
            let app = NSRunningApplication(processIdentifier: pid) {
@@ -226,9 +267,20 @@ final class NowPlayingManager: ObservableObject {
             let sourceChanged = (bundleID != lastSourceBundleID)
             lastSourceBundleID = bundleID
 
-            self.isPlaying = true
-            self.nowPlayingAppIcon = app.icon?.withMinimalistColors()
-            self.nowPlayingAppName = app.localizedName
+            if isVoxSource(bundleID: bundleID, name: app.localizedName) {
+                self.isPlaying = (lastVoxPlayerState == 1)
+            } else {
+                self.isPlaying = true
+            }
+            if sourceChanged || self.nowPlayingAppIcon == nil {
+                if let icon = app.icon?.withMinimalistColors() {
+                    self.nowPlayingAppIcon = icon
+                    self.nowPlayingAppIconSmall = Self.scaledImage(icon, size: CGSize(width: 20, height: 20))
+                }
+            }
+            if sourceChanged || self.nowPlayingAppName == nil {
+                self.nowPlayingAppName = app.localizedName
+            }
             self.isEligibleSource = Self.isEligibleSource(bundleID: bundleID, name: app.localizedName)
             self.isBrowserSource = Self.isBrowser(bundleID: bundleID, name: app.localizedName)
             if self.isEligibleSource {
@@ -236,14 +288,17 @@ final class NowPlayingManager: ObservableObject {
             }
 
             if sourceChanged {
-                self.nowPlayingArtwork = nil
+                let isVox = isVoxSource(bundleID: bundleID, name: app.localizedName)
+                if !isVox {
+                    self.nowPlayingArtwork = nil
+                    self.cachedArtwork = nil
+                }
                 self.trackTitle = nil
                 self.trackArtist = nil
                 self.trackAlbum = nil
                 self.cachedTrackTitle = nil
                 self.cachedTrackArtist = nil
                 self.cachedTrackAlbum = nil
-                self.cachedArtwork = nil
             }
 
             // If the audio source is Brave, try to resolve artwork from the active tab URL
@@ -273,16 +328,23 @@ final class NowPlayingManager: ObservableObject {
             if now.timeIntervalSince(lastAudioSeenAt) < grace {
                 return
             }
+            if shouldPreserveVoxArtwork() {
+                // Keep UI visible when Vox is paused.
+                self.isPlaying = (lastVoxPlayerState == 1)
+                return
+            }
             self.isPlaying = false
             self.nowPlayingAppIcon = nil
-            self.nowPlayingArtwork = nil
+            if !shouldPreserveVoxArtwork() {
+                self.nowPlayingArtwork = nil
+                self.cachedArtwork = nil
+            }
             self.trackTitle = nil
             self.trackArtist = nil
             self.trackAlbum = nil
             self.cachedTrackTitle = nil
             self.cachedTrackArtist = nil
             self.cachedTrackAlbum = nil
-            self.cachedArtwork = nil
             self.nowPlayingAppName = nil
             self.lastSourceBundleID = nil
             self.isEligibleSource = false
@@ -429,12 +491,26 @@ final class NowPlayingManager: ObservableObject {
         lastVoxFetchAt = now
 
         guard let info = Self.voxNowPlayingInfo() else { return }
+        lastVoxPlayerState = info.playerState
+        lastVoxInfoAt = Date()
+        lastVoxActiveAt = Date()
+        let newVoxKey = [
+            info.track.trimmingCharacters(in: .whitespacesAndNewlines),
+            info.artist.trimmingCharacters(in: .whitespacesAndNewlines),
+            info.album.trimmingCharacters(in: .whitespacesAndNewlines)
+        ].joined(separator: "|")
+        if lastVoxTrackKey == nil || lastVoxTrackKey != newVoxKey {
+            lastVoxTrackKey = newVoxKey
+            // New track: allow artwork to refresh from Vox.
+            lastVoxArtworkUpdateAt = .distantPast
+        }
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             let t = info.track.trimmingCharacters(in: .whitespacesAndNewlines)
             let a = info.artist.trimmingCharacters(in: .whitespacesAndNewlines)
             let al = info.album.trimmingCharacters(in: .whitespacesAndNewlines)
 
+            self.isPlaying = (info.playerState == 1)
             if !t.isEmpty { self.trackTitle = t; self.cachedTrackTitle = t }
             if !a.isEmpty { self.trackArtist = a; self.cachedTrackArtist = a }
             if !al.isEmpty { self.trackAlbum = al; self.cachedTrackAlbum = al }
@@ -446,9 +522,11 @@ final class NowPlayingManager: ObservableObject {
         if !artBase64.isEmpty, let data = Data(base64Encoded: artBase64), let image = NSImage(data: data) {
             Task { @MainActor [weak self] in
                 guard let self else { return }
+                // Pin Vox artwork for the current track.
                 self.nowPlayingArtwork = image
                 self.cachedArtwork = image
                 self.lastArtworkUpdateAt = Date()
+                self.lastVoxArtworkUpdateAt = Date()
             }
             return
         }
@@ -467,6 +545,7 @@ final class NowPlayingManager: ObservableObject {
                         self.nowPlayingArtwork = artwork
                         self.cachedArtwork = artwork
                         self.lastArtworkUpdateAt = Date()
+                        self.lastVoxArtworkUpdateAt = Date()
                     }
                     return
                 }
@@ -482,6 +561,7 @@ final class NowPlayingManager: ObservableObject {
                     self.nowPlayingArtwork = artwork
                     self.cachedArtwork = artwork
                     self.lastArtworkUpdateAt = Date()
+                    self.lastVoxArtworkUpdateAt = Date()
                 }
             }
         }
@@ -497,6 +577,17 @@ final class NowPlayingManager: ObservableObject {
             return URL(fileURLWithPath: trimmed)
         }
         return URL(string: trimmed)
+    }
+
+    private static func scaledImage(_ image: NSImage, size: CGSize) -> NSImage {
+        let out = NSImage(size: size)
+        out.lockFocus()
+        image.draw(in: NSRect(origin: .zero, size: size),
+                   from: NSRect(origin: .zero, size: image.size),
+                   operation: .sourceOver,
+                   fraction: 1.0)
+        out.unlockFocus()
+        return out
     }
 
     private struct VoxInfo {
@@ -948,8 +1039,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let notchWidth: CGFloat = 330
         let notchHeight: CGFloat = 34
         
-        let expandedWidth: CGFloat = 400
-        let expandedHeight: CGFloat = 120
+        let expandedWidth: CGFloat = 520
+        let expandedHeight: CGFloat = 198
         
         // The *window* needs to be large enough to contain the *expanded* notch, even when it's small.
         // Otherwise, the notch will clip when it animates open.
@@ -1003,6 +1094,7 @@ class BatteryManager: ObservableObject {
     @Published var batteryLevel: Int = 0
     @Published var isLowPowerMode: Bool = false
     private var timer: Timer?
+    private var powerSourceRunLoopSource: CFRunLoopSource?
 
     init() {
         self.isLowPowerMode = ProcessInfo.processInfo.isLowPowerModeEnabled
@@ -1016,9 +1108,30 @@ class BatteryManager: ObservableObject {
             self?.isLowPowerMode = ProcessInfo.processInfo.isLowPowerModeEnabled
         }
         
-        timer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
+        // Instant updates when power source changes.
+        let src = IOPSNotificationCreateRunLoopSource({ context in
+            let unmanaged = Unmanaged<BatteryManager>.fromOpaque(context!).takeUnretainedValue()
+            DispatchQueue.main.async {
+                unmanaged.updateBattery()
+            }
+        }, UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque()))
+        if let src {
+            let source = src.takeRetainedValue()
+            powerSourceRunLoopSource = source
+            CFRunLoopAddSource(CFRunLoopGetMain(), source, .defaultMode)
+        }
+
+        // Keep a periodic poll as a fallback.
+        timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
             self?.updateBattery()
         }
+    }
+
+    deinit {
+        if let src = powerSourceRunLoopSource {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), src, .defaultMode)
+        }
+        timer?.invalidate()
     }
 
     func updateBattery() {
@@ -1033,16 +1146,24 @@ class BatteryManager: ObservableObject {
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         if let output = String(data: data, encoding: .utf8) {
             // Find percentage using simple string parsing or regex
-            if let range = output.range(of: "\\d+%", options: .regularExpression) {
-                let foundPercentage = String(output[range])
-                let intVal = Int(foundPercentage.dropLast()) ?? 0
-                let charging = output.contains("charging") && !output.contains("discharging")
-                DispatchQueue.main.async {
+            let percentRange = output.range(of: "\\d+%", options: .regularExpression)
+            let foundPercentage = percentRange.map { String(output[$0]) }
+            let intVal = foundPercentage.flatMap { Int($0.dropLast()) } ?? 0
+
+            // Parse status from the battery line (charging/charged/discharging).
+            let batteryLine = output.split(separator: "\n").first { $0.contains("%") } ?? ""
+            let line = batteryLine.lowercased()
+            let isDischarging = line.contains("discharging")
+            let isCharging = line.contains("charging") || line.contains("charged") || line.contains("finishing charge")
+            let charging = isCharging && !isDischarging
+
+            DispatchQueue.main.async {
+                if let foundPercentage {
                     self.percentage = foundPercentage
                     self.batteryLevel = intVal
-                    self.isCharging = charging
-                    self.isLowPowerMode = ProcessInfo.processInfo.isLowPowerModeEnabled
                 }
+                self.isCharging = charging
+                self.isLowPowerMode = ProcessInfo.processInfo.isLowPowerModeEnabled
             }
         }
     }
@@ -1075,13 +1196,12 @@ struct NotchView: View {
     }
     
     private func batteryIconName(level: Int, isCharging: Bool) -> String {
-        let suffix = isCharging ? ".bolt" : ""
         switch level {
-        case 0...15: return "battery.0\(suffix)"
-        case 16...35: return "battery.25\(suffix)"
-        case 36...65: return "battery.50\(suffix)"
-        case 66...85: return "battery.75\(suffix)"
-        default: return "battery.100\(suffix)"
+        case 0...15: return "battery.0"
+        case 16...35: return "battery.25"
+        case 36...65: return "battery.50"
+        case 66...85: return "battery.75"
+        default: return "battery.100"
         }
     }
     
@@ -1094,6 +1214,41 @@ struct NotchView: View {
             return .red
         } else {
             return .white
+        }
+    }
+
+    private var batteryIconView: some View {
+        let level = min(max(batteryManager.batteryLevel, 0), 100)
+        let fillRatio = CGFloat(level) / 100.0
+        let stroke = batteryColor(level: level, isCharging: batteryManager.isCharging, isLowPower: batteryManager.isLowPowerMode)
+        let bodySize = CGSize(width: 18, height: 9)
+        let innerSize = CGSize(width: bodySize.width - 2, height: bodySize.height - 2)
+        let fillWidth = max(1, innerSize.width * fillRatio)
+
+        return ZStack(alignment: .leading) {
+            RoundedRectangle(cornerRadius: 2, style: .continuous)
+                .stroke(stroke, lineWidth: 1)
+                .frame(width: bodySize.width, height: bodySize.height)
+
+            RoundedRectangle(cornerRadius: 1, style: .continuous)
+                .fill(stroke)
+                .frame(width: fillWidth, height: innerSize.height)
+                .padding(1)
+
+            // Battery nub
+            RoundedRectangle(cornerRadius: 1, style: .continuous)
+                .fill(stroke)
+                .frame(width: 2, height: 5)
+                .offset(x: bodySize.width + 1)
+
+            if batteryManager.isCharging {
+                Image(systemName: "bolt.fill")
+                    .font(.system(size: 8, weight: .bold))
+                    .foregroundColor(.white.opacity(0.95))
+                    .shadow(color: .black.opacity(0.5), radius: 1, x: 0, y: 0)
+                    .frame(width: bodySize.width, height: bodySize.height, alignment: .center)
+                    .offset(x: 0.5)
+            }
         }
     }
 
@@ -1114,26 +1269,24 @@ struct NotchView: View {
         return nowPlayingManager.isPlaying ? "Now Playing" : "Nothing Playing"
     }
 
-    private var miniPlayerSubtitle: String {
+    private var miniPlayerAlbumName: String? {
+        let recent = Date().timeIntervalSince(nowPlayingManager.lastTrackUpdateAt) < 5.0
+        let album = nowPlayingManager.trackAlbum?.trimmingCharacters(in: .whitespacesAndNewlines) ??
+            (recent ? nowPlayingManager.cachedTrackAlbum?.trimmingCharacters(in: .whitespacesAndNewlines) : nil)
+        if let album, !album.isEmpty {
+            return album
+        }
+        return nil
+    }
+
+    private var miniPlayerArtistName: String? {
         let recent = Date().timeIntervalSince(nowPlayingManager.lastTrackUpdateAt) < 5.0
         let artist = nowPlayingManager.trackArtist?.trimmingCharacters(in: .whitespacesAndNewlines) ??
             (recent ? nowPlayingManager.cachedTrackArtist?.trimmingCharacters(in: .whitespacesAndNewlines) : nil)
-        let album = nowPlayingManager.trackAlbum?.trimmingCharacters(in: .whitespacesAndNewlines) ??
-            (recent ? nowPlayingManager.cachedTrackAlbum?.trimmingCharacters(in: .whitespacesAndNewlines) : nil)
-
-        let hasArtist = (artist?.isEmpty == false)
-        let hasAlbum = (album?.isEmpty == false)
-
-        if hasArtist && hasAlbum {
-            return "\(artist!) • Album: \(album!)"
+        if let artist, !artist.isEmpty {
+            return artist
         }
-        if hasAlbum {
-            return "Album: \(album!)"
-        }
-        if hasArtist {
-            return artist!
-        }
-        return nowPlayingManager.isPlaying ? "Audio source" : "Hover to play something"
+        return nil
     }
 
     private var miniPlayerArt: some View {
@@ -1152,9 +1305,9 @@ struct NotchView: View {
                     .foregroundColor(.white.opacity(0.7))
             }
         }
-        .frame(width: 30, height: 30)
+        .frame(width: 80, height: 80)
         .background(Color.white.opacity(0.08))
-        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 6, style: .continuous)
                 .stroke(Color.white.opacity(0.08), lineWidth: 1)
@@ -1375,35 +1528,36 @@ struct NotchView: View {
     }
 
     private var miniPlayerPanel: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(alignment: .center, spacing: 8) {
-                miniPlayerArt
+        VStack(alignment: .leading, spacing: 4) {
+            miniPlayerArt
 
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(miniPlayerTitle)
-                        .font(.system(size: 10, weight: .semibold, design: .rounded))
-                        .foregroundColor(.white)
-                        .lineLimit(1)
+            if let albumName = miniPlayerAlbumName {
+                Text(albumName)
+                    .font(.system(size: 10, weight: .regular, design: .rounded))
+                    .foregroundColor(.white.opacity(0.7))
+                    .lineLimit(1)
+            }
 
-                    HStack(spacing: 4) {
-                        Image(systemName: nowPlayingManager.isPlaying ? "speaker.wave.2.fill" : "speaker.slash.fill")
-                            .font(.system(size: 8, weight: .regular))
-                            .foregroundColor(.white.opacity(0.7))
-                        Text(miniPlayerSubtitle)
-                            .font(.system(size: 9, weight: .regular, design: .rounded))
-                            .foregroundColor(.white.opacity(0.7))
-                            .lineLimit(1)
-                    }
-                }
+            Text(miniPlayerTitle)
+                .font(.system(size: 12, weight: .semibold, design: .rounded))
+                .foregroundColor(.white)
+                .lineLimit(1)
+
+            if let artistName = miniPlayerArtistName {
+                Text(artistName)
+                    .font(.system(size: 10, weight: .regular, design: .rounded))
+                    .foregroundColor(.white.opacity(0.65))
+                    .lineLimit(1)
             }
 
             miniPlayerControls
         }
-        .padding(.vertical, 6)
-        .padding(.horizontal, 8)
+        .offset(x: -10, y: -6)
+        .padding(.vertical, 10)
+        .padding(.horizontal, 12)
         .background(Color.white.opacity(0.06))
         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-        .frame(maxWidth: 230, alignment: .leading)
+        .frame(maxWidth: 300, maxHeight: expandedHeight - 16, alignment: .topLeading)
     }
 
     private var browserPermissionPanel: some View {
@@ -1440,13 +1594,16 @@ struct NotchView: View {
 
     private var appIconView: some View {
         Group {
-            if let image = nowPlayingManager.nowPlayingAppIcon ?? activeAppIcon {
+            if let image = nowPlayingManager.nowPlayingAppIconSmall
+                ?? nowPlayingManager.nowPlayingAppIcon
+                ?? activeAppIcon {
                 Image(nsImage: image)
                     .resizable()
                     .scaledToFit()
             }
         }
         .frame(width: 20, height: 20, alignment: .center)
+        .transaction { $0.animation = nil }
     }
 
     private var isFrontmostBrowser: Bool {
@@ -1467,7 +1624,7 @@ struct NotchView: View {
                     .fill(Color.black)
                     .ignoresSafeArea()
                     .frame(
-                        width: isHovered ? expandedWidth : baseWidth, 
+                        width: isHovered ? expandedWidth : baseWidth,
                         height: isHovered ? expandedHeight : baseHeight
                     )
                     .overlay(
@@ -1493,18 +1650,19 @@ struct NotchView: View {
                             Spacer(minLength: 0)
                             
                             // Right: Battery
-                            HStack(alignment: .center, spacing: 4) {
-                                Text("\(batteryManager.batteryLevel)%")
-                                    .font(.system(size: 10, weight: .bold, design: .rounded))
-                                    .foregroundColor(.white)
-                                    .padding(.top, 1) // slight baseline adjustment
-                                
-                                Image(systemName: batteryIconName(level: batteryManager.batteryLevel, isCharging: batteryManager.isCharging))
-                                    .font(.system(size: 14, weight: .regular))
-                                    .foregroundColor(batteryColor(level: batteryManager.batteryLevel,
-                                                                  isCharging: batteryManager.isCharging,
-                                                                  isLowPower: batteryManager.isLowPowerMode))
+                            Button {
+                                NSWorkspace.shared.open(URL(fileURLWithPath: "/System/Library/PreferencePanes/Battery.prefPane"))
+                            } label: {
+                                HStack(alignment: .center, spacing: 4) {
+                                    Text("\(batteryManager.batteryLevel)%")
+                                        .font(.system(size: 10, weight: .bold, design: .rounded))
+                                        .foregroundColor(.white)
+                                        .padding(.top, 1) // slight baseline adjustment
+                                    
+                                    batteryIconView
+                                }
                             }
+                            .buttonStyle(.plain)
                             .frame(height: 28, alignment: .center)
                             .padding(.top, 2)
                         }
