@@ -359,8 +359,9 @@ final class NowPlayingManager: ObservableObject {
         if already { return }
         UserDefaults.standard.set(true, forKey: didRequestBrowserPermissionKey)
         lastPermissionRequestAt = Date()
+        let front = NSWorkspace.shared.frontmostApplication
         if let browserApp = Self.browserAppName(bundleID: lastSourceBundleID, name: nowPlayingAppName)
-            ?? Self.browserAppName(bundleID: activeAppBundleID, name: activeAppName) {
+            ?? Self.browserAppName(bundleID: front?.bundleIdentifier, name: front?.localizedName) {
             _ = Self.browserActiveTabURLString(appName: browserApp)
         }
     }
@@ -795,16 +796,25 @@ final class NowPlayingManager: ObservableObject {
         return nil
     }
 
-    private static func braveActiveTabURLString() -> String? {
-        // Use AppleScript to get the active tab URL from Brave.
-        // If Brave isn't frontmost, it still typically returns the last active window/tab.
-        let script = """
-        tell application "Brave Browser"
-            if (count of windows) = 0 then return ""
-            set theURL to URL of active tab of front window
-            return theURL
-        end tell
-        """
+    private static func browserActiveTabURLString(appName: String) -> String? {
+        let script: String
+        if appName == "Safari" {
+            script = """
+            tell application "Safari"
+                if (count of windows) = 0 then return ""
+                set theURL to URL of current tab of front window
+                return theURL
+            end tell
+            """
+        } else {
+            script = """
+            tell application "\(appName)"
+                if (count of windows) = 0 then return ""
+                set theURL to URL of active tab of front window
+                return theURL
+            end tell
+            """
+        }
 
         let proc = Process()
         proc.launchPath = "/usr/bin/osascript"
@@ -824,7 +834,7 @@ final class NowPlayingManager: ObservableObject {
         return out.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    private static func braveWebNowPlayingInfo() -> BraveWebInfo? {
+    private static func browserWebNowPlayingInfo(appName: String) -> BrowserWebInfo? {
         let js = """
         (function(){
           const titleEl = document.querySelector('[data-testid="nowplaying-track-link"]');
@@ -846,14 +856,26 @@ final class NowPlayingManager: ObservableObject {
             .replacingOccurrences(of: "\"", with: "\\\"")
             .replacingOccurrences(of: "\n", with: " ")
 
-        let script = """
-        tell application "Brave Browser"
-            if (count of windows) = 0 then return ""
-            set theTab to active tab of front window
-            set result to execute javascript "\(escapedJS)" in theTab
-            return result
-        end tell
-        """
+        let script: String
+        if appName == "Safari" {
+            script = """
+            tell application "Safari"
+                if (count of windows) = 0 then return ""
+                set theTab to current tab of front window
+                set result to do JavaScript "\(escapedJS)" in theTab
+                return result
+            end tell
+            """
+        } else {
+            script = """
+            tell application "\(appName)"
+                if (count of windows) = 0 then return ""
+                set theTab to active tab of front window
+                set result to execute javascript "\(escapedJS)" in theTab
+                return result
+            end tell
+            """
+        }
 
         let proc = Process()
         proc.launchPath = "/usr/bin/osascript"
@@ -872,7 +894,7 @@ final class NowPlayingManager: ObservableObject {
             return nil
         }
 
-        return BraveWebInfo(
+        return BrowserWebInfo(
             title: (obj["title"] as? String) ?? "",
             artist: (obj["artist"] as? String) ?? "",
             artworkURL: (obj["artwork"] as? String) ?? ""
@@ -1420,8 +1442,9 @@ struct NotchView: View {
                 script = "const vox = Application(\(voxTarget)); try { vox.previous(); } catch (e) {}"
             }
             handled = runAppleScript(script, language: "JavaScript")
-        } else if appName.contains("brave") || fallback == "brave-spotify" {
-            handled = runBraveSpotifyCommand(command)
+        } else if appName.contains("brave") || appName.contains("chrome") || appName.contains("edge") || appName.contains("safari") || appName.contains("arc")
+                    || fallback == "browser-spotify" {
+            handled = runBrowserSpotifyCommand(command, appName: nowPlayingManager.nowPlayingAppName)
         } else if fallback == "spotify" {
             let script: String
             switch command {
@@ -1466,7 +1489,8 @@ struct NotchView: View {
         }
     }
 
-    private func runBraveSpotifyCommand(_ command: PlaybackCommand) -> Bool {
+    private func runBrowserSpotifyCommand(_ command: PlaybackCommand, appName: String?) -> Bool {
+        guard let appName else { return false }
         let js: String
         switch command {
         case .playPause:
@@ -1505,13 +1529,24 @@ struct NotchView: View {
             .replacingOccurrences(of: "\"", with: "\\\"")
             .replacingOccurrences(of: "\n", with: " ")
 
-        let script = """
-        tell application "Brave Browser"
-            if (count of windows) = 0 then return false
-            set theTab to active tab of front window
-            set result to execute javascript "\(escapedJS)" in theTab
-        end tell
-        """
+        let script: String
+        if appName == "Safari" {
+            script = """
+            tell application "Safari"
+                if (count of windows) = 0 then return false
+                set theTab to current tab of front window
+                set result to do JavaScript "\(escapedJS)" in theTab
+            end tell
+            """
+        } else {
+            script = """
+            tell application "\(appName)"
+                if (count of windows) = 0 then return false
+                set theTab to active tab of front window
+                set result to execute javascript "\(escapedJS)" in theTab
+            end tell
+            """
+        }
         return runAppleScript(script)
     }
 
