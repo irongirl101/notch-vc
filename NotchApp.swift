@@ -53,6 +53,7 @@ final class NowPlayingManager: ObservableObject {
     private var timer: Timer?
     private var lastBraveTabURL: String?
     private var lastBraveFetchAt: Date = .distantPast
+    private var lastBrowserAppName: String?
     private var lastVoxTrackURL: String?
     private var lastVoxFetchAt: Date = .distantPast
     private var lastVoxFallbackKey: String?
@@ -74,6 +75,10 @@ final class NowPlayingManager: ObservableObject {
 
     var browserEligibilityIsFresh: Bool {
         Date().timeIntervalSince(lastSpotifyWebEligibleAt) < 180.0
+    }
+
+    private var shouldPreserveBrowserState: Bool {
+        (isBrowserSource || lastControllableSource == "browser-spotify") && browserEligibilityIsFresh
     }
 
     private typealias MRRegisterFn = @convention(c) (DispatchQueue) -> Void
@@ -158,6 +163,10 @@ final class NowPlayingManager: ObservableObject {
                         self.maybeUpdateArtworkFromVox()
                         return
                     } else {
+                        if self.shouldPreserveBrowserState {
+                            self.isPlaying = true
+                            return
+                        }
                         self.nowPlayingArtwork = nil
                         self.cachedArtwork = nil
                         self.trackTitle = nil
@@ -351,6 +360,13 @@ final class NowPlayingManager: ObservableObject {
                 self.isPlaying = (lastVoxPlayerState == 1)
                 return
             }
+            if shouldPreserveBrowserState {
+                self.isPlaying = true
+                if self.nowPlayingAppName == nil, let lastBrowserAppName {
+                    self.nowPlayingAppName = lastBrowserAppName
+                }
+                return
+            }
             // If no audio process is detected, but a frontmost browser tab is Spotify,
             // treat it as the active source so browser playback still works.
             if maybeAdoptFrontmostBrowserIfSpotify() {
@@ -408,6 +424,7 @@ final class NowPlayingManager: ObservableObject {
             }
         }
         self.nowPlayingAppName = front.localizedName
+        self.lastBrowserAppName = front.localizedName
         self.lastSourceBundleID = front.bundleIdentifier
         self.isBrowserSource = true
         self.isEligibleSource = true
@@ -544,11 +561,44 @@ final class NowPlayingManager: ObservableObject {
                         self.lastArtworkUpdateAt = Date()
                     }
                 }
+                return
             }
             if oembed == nil {
                 Self.appendDebugLog("BROWSER: oEmbed failed for \(tabURLString)")
             } else {
                 Self.appendDebugLog("BROWSER: oEmbed ok for \(tabURLString)")
+            }
+
+            // Final fallback: parse tab title and look up artwork via iTunes.
+            Self.appendDebugLog("BROWSER: trying tab-title fallback")
+            if let title = Self.browserActiveTabTitle(appName: appName),
+               let parsed = Self.parseSpotifyTabTitle(title) {
+                Self.appendDebugLog("BROWSER: tab title parsed: \(parsed.title) / \(parsed.artist)")
+                let key = "tabtitle|\(parsed.title)|\(parsed.artist)"
+                if key == lastBraveMetaKey { return }
+                lastBraveMetaKey = key
+
+                await MainActor.run {
+                    self.trackTitle = parsed.title
+                    self.cachedTrackTitle = parsed.title
+                    self.trackArtist = parsed.artist
+                    self.cachedTrackArtist = parsed.artist
+                    self.lastTrackUpdateAt = Date()
+                    self.lastControllableSource = "browser-spotify"
+                    self.isEligibleSource = true
+                }
+
+                if let img = await Self.lookupArtwork(artist: parsed.artist, album: "", track: parsed.title) {
+                    await MainActor.run {
+                        self.nowPlayingArtwork = img
+                        self.cachedArtwork = img
+                        self.lastArtworkUpdateAt = Date()
+                    }
+                } else {
+                    Self.appendDebugLog("BROWSER: iTunes lookup failed for \(parsed.title) / \(parsed.artist)")
+                }
+            } else {
+                Self.appendDebugLog("BROWSER: tab title unavailable or unparseable")
             }
         }
     }
@@ -956,6 +1006,77 @@ final class NowPlayingManager: ObservableObject {
         return out.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    private static func browserActiveTabTitle(appName: String) -> String? {
+        let target = appName.lowercased().contains("brave") ? "id \"com.brave.Browser\"" : "\"\(appName)\""
+        let script: String
+        if appName == "Safari" {
+            script = """
+            tell application "Safari"
+                if (count of windows) = 0 then return ""
+                set theTitle to name of current tab of front window
+                return theTitle
+            end tell
+            """
+        } else {
+            script = """
+            tell application \(target)
+                if (count of windows) = 0 then return ""
+                set theTitle to title of active tab of front window
+                return theTitle
+            end tell
+            """
+        }
+
+        let proc = Process()
+        proc.launchPath = "/usr/bin/osascript"
+        proc.arguments = ["-e", script]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        let errPipe = Pipe()
+        proc.standardError = errPipe
+        do {
+            try proc.run()
+        } catch {
+            return nil
+        }
+        proc.waitUntilExit()
+
+        let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+        if let errOut = String(data: errData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !errOut.isEmpty {
+            appendDebugLog("BROWSER: osascript error (tab title): \(errOut.prefix(500))")
+        }
+
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        guard let out = String(data: data, encoding: .utf8) else { return nil }
+        return out.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func parseSpotifyTabTitle(_ raw: String) -> (title: String, artist: String)? {
+        var base = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if base.isEmpty { return nil }
+        base = base.replacingOccurrences(of: " – Spotify", with: "")
+        base = base.replacingOccurrences(of: " - Spotify", with: "")
+        base = base.replacingOccurrences(of: " | Spotify", with: "")
+        base = base.replacingOccurrences(of: " | Spotify – Web Player", with: "")
+
+        if base.contains("•") {
+            let parts = base.split(separator: "•", maxSplits: 1).map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+            if parts.count == 2, !parts[0].isEmpty, !parts[1].isEmpty {
+                return (parts[0], parts[1])
+            }
+        }
+
+        if base.contains(" - ") {
+            let parts = base.split(separator: "-", maxSplits: 1).map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+            if parts.count == 2, !parts[0].isEmpty, !parts[1].isEmpty {
+                return (parts[0], parts[1])
+            }
+        }
+
+        return nil
+    }
+
     private static func browserWebNowPlayingInfo(appName: String) -> BrowserWebInfo? {
         if appName == "Safari" {
             let js = """
@@ -1104,6 +1225,10 @@ final class NowPlayingManager: ObservableObject {
         do {
             let (data, _) = try await URLSession.shared.data(from: url)
             guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+            let type = (obj["type"] as? String) ?? ""
+            if type != "track" {
+                return nil
+            }
             let title = (obj["title"] as? String) ?? ""
             let artist = (obj["author_name"] as? String) ?? ""
             let thumb = (obj["thumbnail_url"] as? String).flatMap(URL.init(string:))
