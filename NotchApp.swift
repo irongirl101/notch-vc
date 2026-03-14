@@ -229,8 +229,9 @@ final class NowPlayingManager: ObservableObject {
                     }
 
                     // If this is a browser, refine eligibility by checking the active tab URL.
-                    if Self.isBrowser(bundleID: app.bundleIdentifier, name: app.localizedName) {
-                        self.maybeUpdateEligibilityFromBrave()
+                    if Self.isBrowser(bundleID: app.bundleIdentifier, name: app.localizedName),
+                       let browserApp = Self.browserAppName(bundleID: app.bundleIdentifier, name: app.localizedName) {
+                        self.maybeUpdateEligibilityFromBrowser(appName: browserApp)
                     }
 
                     // VOX can be the active audio session without MediaRemote metadata.
@@ -301,12 +302,12 @@ final class NowPlayingManager: ObservableObject {
                 self.cachedTrackAlbum = nil
             }
 
-            // If the audio source is Brave, try to resolve artwork from the active tab URL
-            // (Spotify/YouTube web players commonly run in Brave).
-            if let bundleID = app.bundleIdentifier, bundleID.contains("brave") {
-                self.maybeUpdateEligibilityFromBrave()
-                self.maybeUpdateArtworkFromBraveActiveTab()
-                self.maybeUpdateNowPlayingFromBraveWeb()
+            // If the audio source is a browser, try to resolve artwork from the active tab URL
+            // (Spotify/YouTube web players commonly run in browsers).
+            if let browserApp = Self.browserAppName(bundleID: app.bundleIdentifier, name: app.localizedName) {
+                self.maybeUpdateEligibilityFromBrowser(appName: browserApp)
+                self.maybeUpdateArtworkFromBrowserActiveTab(appName: browserApp)
+                self.maybeUpdateNowPlayingFromBrowserWeb(appName: browserApp)
             }
 
             // VOX local files: ask VOX for the track URL and extract embedded artwork.
@@ -358,12 +359,15 @@ final class NowPlayingManager: ObservableObject {
         if already { return }
         UserDefaults.standard.set(true, forKey: didRequestBrowserPermissionKey)
         lastPermissionRequestAt = Date()
-        _ = Self.braveActiveTabURLString()
+        if let browserApp = Self.browserAppName(bundleID: lastSourceBundleID, name: nowPlayingAppName)
+            ?? Self.browserAppName(bundleID: activeAppBundleID, name: activeAppName) {
+            _ = Self.browserActiveTabURLString(appName: browserApp)
+        }
     }
 
-    private func maybeUpdateEligibilityFromBrave() {
+    private func maybeUpdateEligibilityFromBrowser(appName: String) {
         let now = Date()
-        guard let tabURLString = Self.braveActiveTabURLString(),
+        guard let tabURLString = Self.browserActiveTabURLString(appName: appName),
               let url = URL(string: tabURLString) else {
             // If we can't read the tab (permissions), keep eligibility briefly to avoid flicker.
             self.isEligibleSource = now.timeIntervalSince(lastSpotifyWebEligibleAt) < 30.0
@@ -378,24 +382,24 @@ final class NowPlayingManager: ObservableObject {
         }
     }
 
-    private struct BraveWebInfo {
+    private struct BrowserWebInfo {
         let title: String
         let artist: String
         let artworkURL: String
     }
 
-    private func maybeUpdateNowPlayingFromBraveWeb() {
+    private func maybeUpdateNowPlayingFromBrowserWeb(appName: String) {
         let now = Date()
         guard now.timeIntervalSince(lastBraveMetaFetchAt) > 1.0 else { return }
         lastBraveMetaFetchAt = now
 
-        guard let tabURLString = Self.braveActiveTabURLString(),
+        guard let tabURLString = Self.browserActiveTabURLString(appName: appName),
               let url = URL(string: tabURLString),
               (url.host?.lowercased().contains("open.spotify.com") == true) else {
             return
         }
 
-        guard let info = Self.braveWebNowPlayingInfo() else { return }
+        guard let info = Self.browserWebNowPlayingInfo(appName: appName) else { return }
         let key = "\(info.title)|\(info.artist)|\(info.artworkURL)"
         if key == lastBraveMetaKey { return }
         lastBraveMetaKey = key
@@ -415,7 +419,7 @@ final class NowPlayingManager: ObservableObject {
                 self.lastTrackUpdateAt = Date()
             }
             if !t.isEmpty || !a.isEmpty {
-                self.lastControllableSource = "brave-spotify"
+                self.lastControllableSource = "browser-spotify"
                 self.isEligibleSource = true
             }
         }
@@ -440,6 +444,17 @@ final class NowPlayingManager: ObservableObject {
         return id.contains("brave") || id.contains("chrome") || id.contains("edge") || id.contains("safari") || id.contains("arc") || n.contains("brave") || n.contains("chrome") || n.contains("edge") || n.contains("safari") || n.contains("arc")
     }
 
+    private static func browserAppName(bundleID: String?, name: String?) -> String? {
+        let id = bundleID?.lowercased() ?? ""
+        let n = name?.lowercased() ?? ""
+        if id.contains("brave") || n.contains("brave") { return "Brave Browser" }
+        if id.contains("chrome") || n.contains("chrome") { return "Google Chrome" }
+        if id.contains("edge") || n.contains("edge") { return "Microsoft Edge" }
+        if id.contains("safari") || n == "safari" { return "Safari" }
+        if id.contains("arc") || n.contains("arc") { return "Arc" }
+        return nil
+    }
+
     private static func isEligibleSource(bundleID: String?, name: String?) -> Bool {
         let id = bundleID?.lowercased() ?? ""
         let n = name?.lowercased() ?? ""
@@ -455,17 +470,17 @@ final class NowPlayingManager: ObservableObject {
         if id.contains("com.spotify.client") || n.contains("spotify") { return "spotify" }
         if id.contains("com.apple.music") || n == "music" { return "music" }
         if id.contains("vox") || n.contains("vox") { return "vox" }
-        if id.contains("brave") || n.contains("brave") { return "brave-spotify" }
+        if isBrowser(bundleID: bundleID, name: name) { return "browser-spotify" }
         return nil
     }
 
-    private func maybeUpdateArtworkFromBraveActiveTab() {
-        // Throttle: Brave tab URL polling + network fetch can be expensive.
+    private func maybeUpdateArtworkFromBrowserActiveTab(appName: String) {
+        // Throttle: tab URL polling + network fetch can be expensive.
         let now = Date()
         guard now.timeIntervalSince(lastBraveFetchAt) > 1.0 else { return }
         lastBraveFetchAt = now
 
-        guard let tabURLString = Self.braveActiveTabURLString(),
+        guard let tabURLString = Self.browserActiveTabURLString(appName: appName),
               !tabURLString.isEmpty else {
             return
         }
@@ -1594,15 +1609,22 @@ struct NotchView: View {
 
     private var appIconView: some View {
         Group {
-            if let image = nowPlayingManager.nowPlayingAppIconSmall
-                ?? nowPlayingManager.nowPlayingAppIcon
-                ?? activeAppIcon {
+            let recentArt = Date().timeIntervalSince(nowPlayingManager.lastArtworkUpdateAt) < 6.0
+            let art = nowPlayingManager.nowPlayingArtwork ?? (recentArt ? nowPlayingManager.cachedArtwork : nil)
+            if !isHovered, nowPlayingManager.isPlaying, let artwork = art {
+                Image(nsImage: artwork)
+                    .resizable()
+                    .scaledToFit()
+            } else if let image = nowPlayingManager.nowPlayingAppIconSmall
+                        ?? nowPlayingManager.nowPlayingAppIcon
+                        ?? activeAppIcon {
                 Image(nsImage: image)
                     .resizable()
                     .scaledToFit()
             }
         }
         .frame(width: 20, height: 20, alignment: .center)
+        .offset(y: -2)
         .transaction { $0.animation = nil }
     }
 
@@ -1651,7 +1673,9 @@ struct NotchView: View {
                             
                             // Right: Battery
                             Button {
-                                NSWorkspace.shared.open(URL(fileURLWithPath: "/System/Library/PreferencePanes/Battery.prefPane"))
+                                if let url = URL(string: "x-apple.systempreferences:com.apple.preference.battery") {
+                                    NSWorkspace.shared.open(url)
+                                }
                             } label: {
                                 HStack(alignment: .center, spacing: 4) {
                                     Text("\(batteryManager.batteryLevel)%")
