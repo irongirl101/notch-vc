@@ -63,13 +63,18 @@ final class NowPlayingManager: ObservableObject {
     private var lastVoxActiveAt: Date = .distantPast
     private var lastSourceBundleID: String?
     private var lastAudioSeenAt: Date = .distantPast
+    private var lastFrontmostBrowserProbeAt: Date = .distantPast
     @Published var lastTrackUpdateAt: Date = .distantPast
     @Published var lastArtworkUpdateAt: Date = .distantPast
-    private var lastSpotifyWebEligibleAt: Date = .distantPast
+    @Published var lastSpotifyWebEligibleAt: Date = .distantPast
     @Published var lastPermissionRequestAt: Date = .distantPast
     private var lastBraveMetaFetchAt: Date = .distantPast
     private var lastBraveMetaKey: String?
     private let didRequestBrowserPermissionKey = "NotchDidRequestBrowserPermission"
+
+    var browserEligibilityIsFresh: Bool {
+        Date().timeIntervalSince(lastSpotifyWebEligibleAt) < 180.0
+    }
 
     private typealias MRRegisterFn = @convention(c) (DispatchQueue) -> Void
     private typealias MRGetPIDFn = @convention(c) (DispatchQueue, @escaping (Int32) -> Void) -> Void
@@ -212,6 +217,11 @@ final class NowPlayingManager: ObservableObject {
                         return
                     }
                     let sourceChanged = app.bundleIdentifier != self.lastSourceBundleID
+                    if sourceChanged {
+                        let n = app.localizedName ?? "Unknown"
+                        let id = app.bundleIdentifier ?? "Unknown"
+                        Self.appendDebugLog("MR: source=\(n) (\(id))")
+                    }
                     if sourceChanged || self.nowPlayingAppIcon == nil {
                         if let icon = app.icon?.withMinimalistColors() {
                             self.nowPlayingAppIcon = icon
@@ -261,6 +271,7 @@ final class NowPlayingManager: ObservableObject {
     }
 
     private func updateFromCoreAudio() {
+        let now = Date()
         if let pid = Self.currentlyRunningOutputPID(),
            let app = NSRunningApplication(processIdentifier: pid) {
             lastAudioSeenAt = Date()
@@ -289,17 +300,23 @@ final class NowPlayingManager: ObservableObject {
             }
 
             if sourceChanged {
+                let n = app.localizedName ?? "Unknown"
+                let id = bundleID ?? "Unknown"
+                Self.appendDebugLog("CA: source=\(n) (\(id))")
                 let isVox = isVoxSource(bundleID: bundleID, name: app.localizedName)
-                if !isVox {
+                let recentlyBrowser = self.isBrowserSource && now.timeIntervalSince(lastSpotifyWebEligibleAt) < 180.0
+                if !isVox && !recentlyBrowser {
                     self.nowPlayingArtwork = nil
                     self.cachedArtwork = nil
                 }
-                self.trackTitle = nil
-                self.trackArtist = nil
-                self.trackAlbum = nil
-                self.cachedTrackTitle = nil
-                self.cachedTrackArtist = nil
-                self.cachedTrackAlbum = nil
+                if !recentlyBrowser {
+                    self.trackTitle = nil
+                    self.trackArtist = nil
+                    self.trackAlbum = nil
+                    self.cachedTrackTitle = nil
+                    self.cachedTrackArtist = nil
+                    self.cachedTrackAlbum = nil
+                }
             }
 
             // If the audio source is a browser, try to resolve artwork from the active tab URL
@@ -334,6 +351,11 @@ final class NowPlayingManager: ObservableObject {
                 self.isPlaying = (lastVoxPlayerState == 1)
                 return
             }
+            // If no audio process is detected, but a frontmost browser tab is Spotify,
+            // treat it as the active source so browser playback still works.
+            if maybeAdoptFrontmostBrowserIfSpotify() {
+                return
+            }
             self.isPlaying = false
             self.nowPlayingAppIcon = nil
             if !shouldPreserveVoxArtwork() {
@@ -354,6 +376,52 @@ final class NowPlayingManager: ObservableObject {
         }
     }
 
+    private func maybeAdoptFrontmostBrowserIfSpotify() -> Bool {
+        let now = Date()
+        guard now.timeIntervalSince(lastFrontmostBrowserProbeAt) > 0.7 else { return false }
+        lastFrontmostBrowserProbeAt = now
+
+        guard let front = NSWorkspace.shared.frontmostApplication,
+              let browserApp = Self.browserAppName(bundleID: front.bundleIdentifier, name: front.localizedName) else {
+            return false
+        }
+
+        guard let tabURLString = Self.browserActiveTabURLString(appName: browserApp),
+              let url = URL(string: tabURLString),
+              url.host?.lowercased().contains("open.spotify.com") == true else {
+            // If tab URL is unreadable, keep browser eligibility for a grace period to avoid flicker.
+            if now.timeIntervalSince(lastSpotifyWebEligibleAt) < 180.0 {
+                self.isBrowserSource = true
+                self.isEligibleSource = true
+                self.lastControllableSource = "browser-spotify"
+                self.isPlaying = true
+                self.lastAudioSeenAt = now
+                return true
+            }
+            return false
+        }
+
+        if self.nowPlayingAppIcon == nil || self.lastSourceBundleID != front.bundleIdentifier {
+            if let icon = front.icon?.withMinimalistColors() {
+                self.nowPlayingAppIcon = icon
+                self.nowPlayingAppIconSmall = Self.scaledImage(icon, size: CGSize(width: 20, height: 20))
+            }
+        }
+        self.nowPlayingAppName = front.localizedName
+        self.lastSourceBundleID = front.bundleIdentifier
+        self.isBrowserSource = true
+        self.isEligibleSource = true
+        self.lastControllableSource = "browser-spotify"
+        self.isPlaying = true
+        self.lastAudioSeenAt = now
+        self.lastSpotifyWebEligibleAt = now
+
+        Self.appendDebugLog("BROWSER: adopted frontmost Spotify tab (\(browserApp))")
+        self.maybeUpdateArtworkFromBrowserActiveTab(appName: browserApp)
+        self.maybeUpdateNowPlayingFromBrowserWeb(appName: browserApp)
+        return true
+    }
+
     func requestBrowserPermissionIfNeeded() {
         let already = UserDefaults.standard.bool(forKey: didRequestBrowserPermissionKey)
         if already { return }
@@ -371,7 +439,7 @@ final class NowPlayingManager: ObservableObject {
         guard let tabURLString = Self.browserActiveTabURLString(appName: appName),
               let url = URL(string: tabURLString) else {
             // If we can't read the tab (permissions), keep eligibility briefly to avoid flicker.
-            self.isEligibleSource = now.timeIntervalSince(lastSpotifyWebEligibleAt) < 30.0
+            self.isEligibleSource = now.timeIntervalSince(lastSpotifyWebEligibleAt) < 180.0
             return
         }
         let host = url.host?.lowercased() ?? ""
@@ -379,7 +447,7 @@ final class NowPlayingManager: ObservableObject {
             self.isEligibleSource = true
             self.lastSpotifyWebEligibleAt = now
         } else {
-            self.isEligibleSource = now.timeIntervalSince(lastSpotifyWebEligibleAt) < 30.0
+            self.isEligibleSource = now.timeIntervalSince(lastSpotifyWebEligibleAt) < 180.0
         }
     }
 
@@ -394,47 +462,93 @@ final class NowPlayingManager: ObservableObject {
         guard now.timeIntervalSince(lastBraveMetaFetchAt) > 1.0 else { return }
         lastBraveMetaFetchAt = now
 
+        Self.appendDebugLog("BROWSER: checking (app=\(appName))")
+
         guard let tabURLString = Self.browserActiveTabURLString(appName: appName),
-              let url = URL(string: tabURLString),
-              (url.host?.lowercased().contains("open.spotify.com") == true) else {
+              let url = URL(string: tabURLString) else {
+            Self.appendDebugLog("BROWSER: no tab URL (app=\(appName))")
+            return
+        }
+        if url.host?.lowercased().contains("open.spotify.com") != true {
+            Self.appendDebugLog("BROWSER: tab not Spotify (\(tabURLString))")
             return
         }
 
-        guard let info = Self.browserWebNowPlayingInfo(appName: appName) else { return }
-        let key = "\(info.title)|\(info.artist)|\(info.artworkURL)"
-        if key == lastBraveMetaKey { return }
-        lastBraveMetaKey = key
+        if let info = Self.browserWebNowPlayingInfo(appName: appName) {
+            let key = "\(info.title)|\(info.artist)|\(info.artworkURL)"
+            if key == lastBraveMetaKey { return }
+            lastBraveMetaKey = key
 
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            let t = info.title.trimmingCharacters(in: .whitespacesAndNewlines)
-            let a = info.artist.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !t.isEmpty {
-                self.trackTitle = t
-                self.cachedTrackTitle = t
-                self.lastTrackUpdateAt = Date()
-            }
-            if !a.isEmpty {
-                self.trackArtist = a
-                self.cachedTrackArtist = a
-                self.lastTrackUpdateAt = Date()
-            }
-            if !t.isEmpty || !a.isEmpty {
-                self.lastControllableSource = "browser-spotify"
-                self.isEligibleSource = true
-            }
-        }
-
-        if !info.artworkURL.isEmpty, let artURL = URL(string: info.artworkURL) {
-            Task { [weak self] in
+            DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
-                if let img = await Self.downloadImage(artURL) {
-                    await MainActor.run {
+                let t = info.title.trimmingCharacters(in: .whitespacesAndNewlines)
+                let a = info.artist.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !t.isEmpty {
+                    self.trackTitle = t
+                    self.cachedTrackTitle = t
+                    self.lastTrackUpdateAt = Date()
+                }
+                if !a.isEmpty {
+                    self.trackArtist = a
+                    self.cachedTrackArtist = a
+                    self.lastTrackUpdateAt = Date()
+                }
+                if !t.isEmpty || !a.isEmpty {
+                    self.lastControllableSource = "browser-spotify"
+                    self.isEligibleSource = true
+                }
+            }
+
+            if !info.artworkURL.isEmpty, let artURL = URL(string: info.artworkURL) {
+                Task { [weak self] in
+                    guard let self else { return }
+                    if let img = await Self.downloadImage(artURL) {
+                        await MainActor.run {
+                            self.nowPlayingArtwork = img
+                            self.cachedArtwork = img
+                            self.lastArtworkUpdateAt = Date()
+                        }
+                    }
+                }
+            }
+            return
+        }
+        Self.appendDebugLog("BROWSER: JS info nil (app=\(appName))")
+
+        // Fallback: use Spotify oEmbed from the tab URL (works even if JS injection fails).
+        let fallbackKey = "oembed|\(tabURLString)"
+        if fallbackKey == lastBraveMetaKey { return }
+        lastBraveMetaKey = fallbackKey
+        Task { [weak self] in
+            guard let self else { return }
+            let oembed = await Self.spotifyOEmbedInfo(pageURL: url)
+            if let info = oembed {
+                await MainActor.run {
+                    if !info.title.isEmpty {
+                        self.trackTitle = info.title
+                        self.cachedTrackTitle = info.title
+                        self.lastTrackUpdateAt = Date()
+                    }
+                    if !info.artist.isEmpty {
+                        self.trackArtist = info.artist
+                        self.cachedTrackArtist = info.artist
+                        self.lastTrackUpdateAt = Date()
+                    }
+                    if !info.title.isEmpty || !info.artist.isEmpty {
+                        self.lastControllableSource = "browser-spotify"
+                        self.isEligibleSource = true
+                    }
+                    if let img = info.artwork {
                         self.nowPlayingArtwork = img
                         self.cachedArtwork = img
                         self.lastArtworkUpdateAt = Date()
                     }
                 }
+            }
+            if oembed == nil {
+                Self.appendDebugLog("BROWSER: oEmbed failed for \(tabURLString)")
+            } else {
+                Self.appendDebugLog("BROWSER: oEmbed ok for \(tabURLString)")
             }
         }
     }
@@ -797,6 +911,7 @@ final class NowPlayingManager: ObservableObject {
     }
 
     private static func browserActiveTabURLString(appName: String) -> String? {
+        let target = appName.lowercased().contains("brave") ? "id \"com.brave.Browser\"" : "\"\(appName)\""
         let script: String
         if appName == "Safari" {
             script = """
@@ -808,7 +923,7 @@ final class NowPlayingManager: ObservableObject {
             """
         } else {
             script = """
-            tell application "\(appName)"
+            tell application \(target)
                 if (count of windows) = 0 then return ""
                 set theURL to URL of active tab of front window
                 return theURL
@@ -821,7 +936,8 @@ final class NowPlayingManager: ObservableObject {
         proc.arguments = ["-e", script]
         let pipe = Pipe()
         proc.standardOutput = pipe
-        proc.standardError = Pipe()
+        let errPipe = Pipe()
+        proc.standardError = errPipe
         do {
             try proc.run()
         } catch {
@@ -829,36 +945,41 @@ final class NowPlayingManager: ObservableObject {
         }
         proc.waitUntilExit()
 
+        let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+        if let errOut = String(data: errData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !errOut.isEmpty {
+            appendDebugLog("BROWSER: osascript error (tab URL): \(errOut.prefix(500))")
+        }
+
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         guard let out = String(data: data, encoding: .utf8) else { return nil }
         return out.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private static func browserWebNowPlayingInfo(appName: String) -> BrowserWebInfo? {
-        let js = """
-        (function(){
-          const titleEl = document.querySelector('[data-testid="nowplaying-track-link"]');
-          const artistEl = document.querySelector('[data-testid="nowplaying-artist"] a') ||
-                           document.querySelector('[data-testid="nowplaying-artist"]');
-          const imgEl = document.querySelector('img[aria-label="Cover art"]') ||
-                        document.querySelector('img[alt*="Cover"]') ||
-                        document.querySelector('img[alt*="cover"]');
-
-          const title = titleEl ? titleEl.textContent : "";
-          const artist = artistEl ? artistEl.textContent : "";
-          const artwork = imgEl ? imgEl.src : "";
-
-          return JSON.stringify({ title: title, artist: artist, artwork: artwork });
-        })();
-        """
-
-        let escapedJS = js.replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "\"", with: "\\\"")
-            .replacingOccurrences(of: "\n", with: " ")
-
-        let script: String
         if appName == "Safari" {
-            script = """
+            let js = """
+            (function(){
+              const titleEl = document.querySelector("[data-testid='nowplaying-track-link']");
+              const artistEl = document.querySelector("[data-testid='nowplaying-artist'] a") ||
+                               document.querySelector("[data-testid='nowplaying-artist']");
+              const imgEl = document.querySelector("img[aria-label='Cover art']") ||
+                            document.querySelector("img[alt*='Cover']") ||
+                            document.querySelector("img[alt*='cover']");
+
+              const title = titleEl ? titleEl.textContent : '';
+              const artist = artistEl ? artistEl.textContent : '';
+              const artwork = imgEl ? imgEl.src : '';
+
+              return [title, artist, artwork].join('|||');
+            })();
+            """
+
+            let escapedJS = js
+                .replacingOccurrences(of: "\"", with: "\"\"")
+                .replacingOccurrences(of: "\n", with: " ")
+
+            let script = """
             tell application "Safari"
                 if (count of windows) = 0 then return ""
                 set theTab to current tab of front window
@@ -866,39 +987,96 @@ final class NowPlayingManager: ObservableObject {
                 return result
             end tell
             """
-        } else {
-            script = """
-            tell application "\(appName)"
-                if (count of windows) = 0 then return ""
-                set theTab to active tab of front window
-                set result to execute javascript "\(escapedJS)" in theTab
-                return result
-            end tell
-            """
+
+            let proc = Process()
+            proc.launchPath = "/usr/bin/osascript"
+            proc.arguments = ["-e", script]
+            let pipe = Pipe()
+            proc.standardOutput = pipe
+            let errPipe = Pipe()
+            proc.standardError = errPipe
+            do { try proc.run() } catch { return nil }
+            proc.waitUntilExit()
+
+            let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+            if let errOut = String(data: errData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !errOut.isEmpty {
+                appendDebugLog("BROWSER: osascript error (JS): \(errOut.prefix(500))")
+            }
+
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            guard let out = String(data: data, encoding: .utf8) else { return nil }
+            let trimmed = out.trimmingCharacters(in: .whitespacesAndNewlines)
+            let parts = trimmed.components(separatedBy: "|||")
+            if parts.count >= 3 {
+                return BrowserWebInfo(
+                    title: parts[0],
+                    artist: parts[1],
+                    artworkURL: parts[2]
+                )
+            }
+            return nil
         }
+
+        // Chrome-family browsers: use JXA to avoid AppleScript quote escaping issues.
+        let appID: String
+        let lower = appName.lowercased()
+        if lower.contains("brave") { appID = "com.brave.Browser" }
+        else if lower.contains("chrome") { appID = "com.google.Chrome" }
+        else if lower.contains("edge") { appID = "com.microsoft.edgemac" }
+        else if lower.contains("arc") { appID = "company.thebrowser.Browser" }
+        else { appID = appName }
+
+        let jxa = """
+        (function() {
+          var app = Application('\(appID)');
+          if (app.windows.length === 0) return '';
+          var tab = app.windows[0].activeTab();
+          var js = `(function(){
+            const titleEl = document.querySelector('[data-testid="nowplaying-track-link"]');
+            const artistEl = document.querySelector('[data-testid="nowplaying-artist"] a') ||
+                             document.querySelector('[data-testid="nowplaying-artist"]');
+            const imgEl = document.querySelector('img[aria-label="Cover art"]') ||
+                          document.querySelector('img[alt*="Cover"]') ||
+                          document.querySelector('img[alt*="cover"]');
+            const title = titleEl ? titleEl.textContent : '';
+            const artist = artistEl ? artistEl.textContent : '';
+            const artwork = imgEl ? imgEl.src : '';
+            return [title, artist, artwork].join('|||');
+          })();`;
+          var res = tab.execute({javascript: js});
+          return res || '';
+        })();
+        """
 
         let proc = Process()
         proc.launchPath = "/usr/bin/osascript"
-        proc.arguments = ["-e", script]
+        proc.arguments = ["-l", "JavaScript", "-e", jxa]
         let pipe = Pipe()
         proc.standardOutput = pipe
-        proc.standardError = Pipe()
+        let errPipe = Pipe()
+        proc.standardError = errPipe
         do { try proc.run() } catch { return nil }
         proc.waitUntilExit()
+
+        let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+        if let errOut = String(data: errData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !errOut.isEmpty {
+            appendDebugLog("BROWSER: JXA error (JS): \(errOut.prefix(500))")
+        }
 
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         guard let out = String(data: data, encoding: .utf8) else { return nil }
         let trimmed = out.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let jsonData = trimmed.data(using: .utf8),
-              let obj = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any] else {
-            return nil
+        let parts = trimmed.components(separatedBy: "|||")
+        if parts.count >= 3 {
+            return BrowserWebInfo(
+                title: parts[0],
+                artist: parts[1],
+                artworkURL: parts[2]
+            )
         }
-
-        return BrowserWebInfo(
-            title: (obj["title"] as? String) ?? "",
-            artist: (obj["artist"] as? String) ?? "",
-            artworkURL: (obj["artwork"] as? String) ?? ""
-        )
+        return nil
     }
 
     private static func artworkForWebMedia(pageURL: URL) async -> NSImage? {
@@ -911,6 +1089,29 @@ final class NowPlayingManager: ObservableObject {
         }
 
         return nil
+    }
+
+    private struct OEmbedInfo {
+        let title: String
+        let artist: String
+        let artwork: NSImage?
+    }
+
+    private static func spotifyOEmbedInfo(pageURL: URL) async -> OEmbedInfo? {
+        guard let url = URL(string: "https://open.spotify.com/oembed?url=\(pageURL.absoluteString.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? "")") else {
+            return nil
+        }
+        do {
+            let (data, _) = try await URLSession.shared.data(from: url)
+            guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+            let title = (obj["title"] as? String) ?? ""
+            let artist = (obj["author_name"] as? String) ?? ""
+            let thumb = (obj["thumbnail_url"] as? String).flatMap(URL.init(string:))
+            let artwork = thumb != nil ? await downloadImage(thumb!) : nil
+            return OEmbedInfo(title: title, artist: artist, artwork: artwork)
+        } catch {
+            return nil
+        }
     }
 
     private static func oEmbedThumbnailURL(provider: String, pageURL: URL) async -> URL? {
@@ -1529,6 +1730,7 @@ struct NotchView: View {
             .replacingOccurrences(of: "\"", with: "\\\"")
             .replacingOccurrences(of: "\n", with: " ")
 
+        let target = appName.lowercased().contains("brave") ? "id \"com.brave.Browser\"" : "\"\(appName)\""
         let script: String
         if appName == "Safari" {
             script = """
@@ -1540,7 +1742,7 @@ struct NotchView: View {
             """
         } else {
             script = """
-            tell application "\(appName)"
+            tell application \(target)
                 if (count of windows) = 0 then return false
                 set theTab to active tab of front window
                 set result to execute javascript "\(escapedJS)" in theTab
@@ -1694,7 +1896,9 @@ struct NotchView: View {
                                         appIconView
                                         miniPlayerPanel
                                         let recentlyRequested = Date().timeIntervalSince(nowPlayingManager.lastPermissionRequestAt) < 10.0
-                                        if (nowPlayingManager.isBrowserSource || isFrontmostBrowser || recentlyRequested) && !nowPlayingManager.isEligibleSource {
+                                        if (nowPlayingManager.isBrowserSource || isFrontmostBrowser || recentlyRequested)
+                                            && !nowPlayingManager.isEligibleSource
+                                            && !nowPlayingManager.browserEligibilityIsFresh {
                                             browserPermissionPanel
                                         }
                                     }

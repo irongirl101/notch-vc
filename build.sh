@@ -42,8 +42,8 @@ echo -n "" > "${APP_RESOURCES_DIR}/.placeholder"
 # Remove any extended attributes before signing
 xattr -cr "${APP_BUNDLE}" 2>/dev/null || true
 
-# Ad-hoc sign to avoid Gatekeeper/LaunchServices issues
-codesign --force --deep --sign - "${APP_BUNDLE}"
+# Sign with stable local identity to keep Automation permissions
+codesign --force --deep --sign "46A75445ABA9E7526CD49DD2471F034E8053E2D1" "${APP_BUNDLE}"
 
 # Let user know
 echo "Successfully built ${APP_BUNDLE}"
