@@ -2,6 +2,8 @@ import Cocoa
 import SwiftUI
 import CoreImage
 import CoreAudio
+import IOKit.hid
+import ApplicationServices
 import Foundation
 import AVFoundation
 import IOKit.ps
@@ -71,6 +73,7 @@ final class NowPlayingManager: ObservableObject {
     @Published var lastPermissionRequestAt: Date = .distantPast
     private var lastBraveMetaFetchAt: Date = .distantPast
     private var lastBraveMetaKey: String?
+    private var lastBraveTitleKey: String?
     private let didRequestBrowserPermissionKey = "NotchDidRequestBrowserPermission"
 
     var browserEligibilityIsFresh: Bool {
@@ -106,6 +109,10 @@ final class NowPlayingManager: ObservableObject {
         mrGetPID = load("MRMediaRemoteGetNowPlayingApplicationPID", as: MRGetPIDFn.self)
         mrGetIsPlaying = load("MRMediaRemoteGetNowPlayingApplicationIsPlaying", as: MRGetIsPlayingFn.self)
         mrGetNowPlayingInfo = load("MRMediaRemoteGetNowPlayingInfo", as: MRGetNowPlayingInfoFn.self)
+
+        let axOptions = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+        let axTrusted = AXIsProcessTrustedWithOptions(axOptions)
+        Self.appendDebugLog("NOTCH: NowPlayingManager init axTrusted=\(axTrusted)")
 
         // If MediaRemote isn't available, keep a no-op manager.
         let mediaRemoteAvailable = (mrRegister != nil && mrGetPID != nil && mrGetIsPlaying != nil)
@@ -148,6 +155,9 @@ final class NowPlayingManager: ObservableObject {
     }
 
     private func refresh() {
+        // Always poll the frontmost browser for metadata (web players may not show up in CoreAudio/MR).
+        pollFrontmostBrowserIfNeeded()
+
         // 1) Try MediaRemote first (best signal when available)
         if let mrGetIsPlaying, let mrGetPID, let mrGetNowPlayingInfo {
             mrGetIsPlaying(queue) { [weak self] playing in
@@ -264,6 +274,15 @@ final class NowPlayingManager: ObservableObject {
 
         // 2) Fallback: CoreAudio process list
         updateFromCoreAudio()
+    }
+
+    private func pollFrontmostBrowserIfNeeded() {
+        let front = NSWorkspace.shared.frontmostApplication
+        guard let browserApp = Self.browserAppName(bundleID: front?.bundleIdentifier, name: front?.localizedName) else { return }
+        self.isBrowserSource = true
+        self.maybeUpdateEligibilityFromBrowser(appName: browserApp)
+        self.maybeUpdateArtworkFromBrowserActiveTab(appName: browserApp)
+        self.maybeUpdateNowPlayingFromBrowserWeb(appName: browserApp)
     }
 
     private func isVoxSource(bundleID: String?, name: String?) -> Bool {
@@ -471,6 +490,7 @@ final class NowPlayingManager: ObservableObject {
     private struct BrowserWebInfo {
         let title: String
         let artist: String
+        let album: String
         let artworkURL: String
     }
 
@@ -484,6 +504,34 @@ final class NowPlayingManager: ObservableObject {
         guard let tabURLString = Self.browserActiveTabURLString(appName: appName),
               let url = URL(string: tabURLString) else {
             Self.appendDebugLog("BROWSER: no tab URL (app=\(appName))")
+            // Try tab-title fallback even without URL.
+            if let title = Self.browserActiveTabTitle(appName: appName),
+               let parsed = Self.parseSpotifyTabTitle(title) {
+                let key = "tabtitle|\(parsed.title)|\(parsed.artist)"
+                if key != lastBraveTitleKey {
+                    lastBraveTitleKey = key
+                    DispatchQueue.main.async { [weak self] in
+                        guard let self else { return }
+                        self.trackTitle = parsed.title
+                        self.cachedTrackTitle = parsed.title
+                        self.trackArtist = parsed.artist
+                        self.cachedTrackArtist = parsed.artist
+                        self.lastTrackUpdateAt = Date()
+                        self.lastControllableSource = "browser-spotify"
+                        self.isEligibleSource = true
+                    }
+                    Task { [weak self] in
+                        guard let self else { return }
+                        if let img = await Self.lookupArtwork(artist: parsed.artist, album: "", track: parsed.title) {
+                            await MainActor.run {
+                                self.nowPlayingArtwork = img
+                                self.cachedArtwork = img
+                                self.lastArtworkUpdateAt = Date()
+                            }
+                        }
+                    }
+                }
+            }
             return
         }
         if url.host?.lowercased().contains("open.spotify.com") != true {
@@ -491,8 +539,37 @@ final class NowPlayingManager: ObservableObject {
             return
         }
 
+        // Fast path: use the tab title (does not require JS from Apple Events).
+        if let title = Self.browserActiveTabTitle(appName: appName),
+           let parsed = Self.parseSpotifyTabTitle(title) {
+            let key = "tabtitle|\(parsed.title)|\(parsed.artist)"
+            if key != lastBraveTitleKey {
+                lastBraveTitleKey = key
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    self.trackTitle = parsed.title
+                    self.cachedTrackTitle = parsed.title
+                    self.trackArtist = parsed.artist
+                    self.cachedTrackArtist = parsed.artist
+                    self.lastTrackUpdateAt = Date()
+                    self.lastControllableSource = "browser-spotify"
+                    self.isEligibleSource = true
+                }
+                Task { [weak self] in
+                    guard let self else { return }
+                    if let img = await Self.lookupArtwork(artist: parsed.artist, album: "", track: parsed.title) {
+                        await MainActor.run {
+                            self.nowPlayingArtwork = img
+                            self.cachedArtwork = img
+                            self.lastArtworkUpdateAt = Date()
+                        }
+                    }
+                }
+            }
+        }
+
         if let info = Self.browserWebNowPlayingInfo(appName: appName) {
-            let key = "\(info.title)|\(info.artist)|\(info.artworkURL)"
+            let key = "\(info.title)|\(info.artist)|\(info.album)|\(info.artworkURL)"
             if key == lastBraveMetaKey { return }
             lastBraveMetaKey = key
 
@@ -500,6 +577,7 @@ final class NowPlayingManager: ObservableObject {
                 guard let self else { return }
                 let t = info.title.trimmingCharacters(in: .whitespacesAndNewlines)
                 let a = info.artist.trimmingCharacters(in: .whitespacesAndNewlines)
+                let al = info.album.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !t.isEmpty {
                     self.trackTitle = t
                     self.cachedTrackTitle = t
@@ -510,7 +588,12 @@ final class NowPlayingManager: ObservableObject {
                     self.cachedTrackArtist = a
                     self.lastTrackUpdateAt = Date()
                 }
-                if !t.isEmpty || !a.isEmpty {
+                if !al.isEmpty {
+                    self.trackAlbum = al
+                    self.cachedTrackAlbum = al
+                    self.lastTrackUpdateAt = Date()
+                }
+                if !t.isEmpty || !a.isEmpty || !al.isEmpty {
                     self.lastControllableSource = "browser-spotify"
                     self.isEligibleSource = true
                 }
@@ -534,39 +617,43 @@ final class NowPlayingManager: ObservableObject {
 
         // Fallback: use Spotify oEmbed from the tab URL (works even if JS injection fails).
         let fallbackKey = "oembed|\(tabURLString)"
-        if fallbackKey == lastBraveMetaKey { return }
-        lastBraveMetaKey = fallbackKey
+        let shouldTryOEmbed = fallbackKey != lastBraveMetaKey
+        if shouldTryOEmbed {
+            lastBraveMetaKey = fallbackKey
+        }
         Task { [weak self] in
             guard let self else { return }
-            let oembed = await Self.spotifyOEmbedInfo(pageURL: url)
-            if let info = oembed {
-                await MainActor.run {
-                    if !info.title.isEmpty {
-                        self.trackTitle = info.title
-                        self.cachedTrackTitle = info.title
-                        self.lastTrackUpdateAt = Date()
+            if shouldTryOEmbed {
+                let oembed = await Self.spotifyOEmbedInfo(pageURL: url)
+                if let info = oembed {
+                    await MainActor.run {
+                        if !info.title.isEmpty {
+                            self.trackTitle = info.title
+                            self.cachedTrackTitle = info.title
+                            self.lastTrackUpdateAt = Date()
+                        }
+                        if !info.artist.isEmpty {
+                            self.trackArtist = info.artist
+                            self.cachedTrackArtist = info.artist
+                            self.lastTrackUpdateAt = Date()
+                        }
+                        if !info.title.isEmpty || !info.artist.isEmpty {
+                            self.lastControllableSource = "browser-spotify"
+                            self.isEligibleSource = true
+                        }
+                        if let img = info.artwork {
+                            self.nowPlayingArtwork = img
+                            self.cachedArtwork = img
+                            self.lastArtworkUpdateAt = Date()
+                        }
                     }
-                    if !info.artist.isEmpty {
-                        self.trackArtist = info.artist
-                        self.cachedTrackArtist = info.artist
-                        self.lastTrackUpdateAt = Date()
-                    }
-                    if !info.title.isEmpty || !info.artist.isEmpty {
-                        self.lastControllableSource = "browser-spotify"
-                        self.isEligibleSource = true
-                    }
-                    if let img = info.artwork {
-                        self.nowPlayingArtwork = img
-                        self.cachedArtwork = img
-                        self.lastArtworkUpdateAt = Date()
-                    }
+                    return
                 }
-                return
-            }
-            if oembed == nil {
-                Self.appendDebugLog("BROWSER: oEmbed failed for \(tabURLString)")
-            } else {
-                Self.appendDebugLog("BROWSER: oEmbed ok for \(tabURLString)")
+                if oembed == nil {
+                    Self.appendDebugLog("BROWSER: oEmbed failed for \(tabURLString)")
+                } else {
+                    Self.appendDebugLog("BROWSER: oEmbed ok for \(tabURLString)")
+                }
             }
 
             // Final fallback: parse tab title and look up artwork via iTunes.
@@ -575,8 +662,8 @@ final class NowPlayingManager: ObservableObject {
                let parsed = Self.parseSpotifyTabTitle(title) {
                 Self.appendDebugLog("BROWSER: tab title parsed: \(parsed.title) / \(parsed.artist)")
                 let key = "tabtitle|\(parsed.title)|\(parsed.artist)"
-                if key == lastBraveMetaKey { return }
-                lastBraveMetaKey = key
+                if key == lastBraveTitleKey { return }
+                lastBraveTitleKey = key
 
                 await MainActor.run {
                     self.trackTitle = parsed.title
@@ -916,7 +1003,7 @@ final class NowPlayingManager: ObservableObject {
         )
     }
 
-    private static func appendDebugLog(_ message: String) {
+    static func appendDebugLog(_ message: String) {
         let ts = ISO8601DateFormatter().string(from: Date())
         let line = "[\(ts)] \(message)\n"
         let url = URL(fileURLWithPath: "/tmp/notch-vox-debug.log")
@@ -931,6 +1018,13 @@ final class NowPlayingManager: ObservableObject {
                 try? data.write(to: url, options: .atomic)
             }
         }
+    }
+
+    static func inputMonitoringAllowed() -> Bool {
+        if #available(macOS 10.15, *) {
+            return IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) == kIOHIDAccessTypeGranted
+        }
+        return true
     }
 
     private static func embeddedArtwork(for url: URL) async -> NSImage? {
@@ -1049,7 +1143,9 @@ final class NowPlayingManager: ObservableObject {
 
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         guard let out = String(data: data, encoding: .utf8) else { return nil }
-        return out.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmed = out.trimmingCharacters(in: .whitespacesAndNewlines)
+        appendDebugLog("BROWSER: tab title raw: \(trimmed.prefix(200))")
+        return trimmed
     }
 
     private static func parseSpotifyTabTitle(_ raw: String) -> (title: String, artist: String)? {
@@ -1081,18 +1177,49 @@ final class NowPlayingManager: ObservableObject {
         if appName == "Safari" {
             let js = """
             (function(){
-              const titleEl = document.querySelector("[data-testid='nowplaying-track-link']");
-              const artistEl = document.querySelector("[data-testid='nowplaying-artist'] a") ||
-                               document.querySelector("[data-testid='nowplaying-artist']");
-              const imgEl = document.querySelector("img[aria-label='Cover art']") ||
-                            document.querySelector("img[alt*='Cover']") ||
-                            document.querySelector("img[alt*='cover']");
+              function pickText(el){ return el ? (el.textContent || '').trim() : ''; }
+              function pickSrc(el){ return el ? (el.src || '').trim() : ''; }
 
-              const title = titleEl ? titleEl.textContent : '';
-              const artist = artistEl ? artistEl.textContent : '';
-              const artwork = imgEl ? imgEl.src : '';
+              let title = '';
+              let artist = '';
+              let album = '';
+              let artwork = '';
 
-              return [title, artist, artwork].join('|||');
+              const ms = (navigator.mediaSession && navigator.mediaSession.metadata) ? navigator.mediaSession.metadata : null;
+              if (ms) {
+                title = ms.title || '';
+                artist = ms.artist || '';
+                album = ms.album || '';
+                if (ms.artwork && ms.artwork.length) {
+                  artwork = ms.artwork[ms.artwork.length - 1].src || '';
+                }
+              }
+
+              if (!title) {
+                const titleEl = document.querySelector("[data-testid='nowplaying-track-link']");
+                title = pickText(titleEl);
+              }
+              if (!artist) {
+                const artistEl = document.querySelector("[data-testid='nowplaying-artist'] a") ||
+                                 document.querySelector("[data-testid='nowplaying-artist']");
+                artist = pickText(artistEl);
+              }
+              if (!album) {
+                const albumEl = document.querySelector("[data-testid='nowplaying-album'] a") ||
+                                document.querySelector("[data-testid='nowplaying-album']") ||
+                                document.querySelector("[data-testid='nowplaying-album-link']") ||
+                                document.querySelector("[data-testid='context-item-info-title']") ||
+                                document.querySelector("a[href*='/album/']");
+                album = pickText(albumEl);
+              }
+              if (!artwork) {
+                const imgEl = document.querySelector("img[aria-label='Cover art']") ||
+                              document.querySelector("img[alt*='Cover']") ||
+                              document.querySelector("img[alt*='cover']");
+                artwork = pickSrc(imgEl);
+              }
+
+              return [title, artist, album, artwork].join('|||');
             })();
             """
 
@@ -1129,11 +1256,12 @@ final class NowPlayingManager: ObservableObject {
             guard let out = String(data: data, encoding: .utf8) else { return nil }
             let trimmed = out.trimmingCharacters(in: .whitespacesAndNewlines)
             let parts = trimmed.components(separatedBy: "|||")
-            if parts.count >= 3 {
+            if parts.count >= 4 {
                 return BrowserWebInfo(
                     title: parts[0],
                     artist: parts[1],
-                    artworkURL: parts[2]
+                    album: parts[2],
+                    artworkURL: parts[3]
                 )
             }
             return nil
@@ -1154,16 +1282,49 @@ final class NowPlayingManager: ObservableObject {
           if (app.windows.length === 0) return '';
           var tab = app.windows[0].activeTab();
           var js = `(function(){
-            const titleEl = document.querySelector('[data-testid="nowplaying-track-link"]');
-            const artistEl = document.querySelector('[data-testid="nowplaying-artist"] a') ||
-                             document.querySelector('[data-testid="nowplaying-artist"]');
-            const imgEl = document.querySelector('img[aria-label="Cover art"]') ||
-                          document.querySelector('img[alt*="Cover"]') ||
-                          document.querySelector('img[alt*="cover"]');
-            const title = titleEl ? titleEl.textContent : '';
-            const artist = artistEl ? artistEl.textContent : '';
-            const artwork = imgEl ? imgEl.src : '';
-            return [title, artist, artwork].join('|||');
+            function pickText(el){ return el ? (el.textContent || '').trim() : ''; }
+            function pickSrc(el){ return el ? (el.src || '').trim() : ''; }
+
+            let title = '';
+            let artist = '';
+            let album = '';
+            let artwork = '';
+
+            const ms = (navigator.mediaSession && navigator.mediaSession.metadata) ? navigator.mediaSession.metadata : null;
+            if (ms) {
+              title = ms.title || '';
+              artist = ms.artist || '';
+              album = ms.album || '';
+              if (ms.artwork && ms.artwork.length) {
+                artwork = ms.artwork[ms.artwork.length - 1].src || '';
+              }
+            }
+
+            if (!title) {
+              const titleEl = document.querySelector('[data-testid="nowplaying-track-link"]');
+              title = pickText(titleEl);
+            }
+            if (!artist) {
+              const artistEl = document.querySelector('[data-testid="nowplaying-artist"] a') ||
+                               document.querySelector('[data-testid="nowplaying-artist"]');
+              artist = pickText(artistEl);
+            }
+            if (!album) {
+              const albumEl = document.querySelector('[data-testid="nowplaying-album"] a') ||
+                              document.querySelector('[data-testid="nowplaying-album"]') ||
+                              document.querySelector('[data-testid="nowplaying-album-link"]') ||
+                              document.querySelector('[data-testid="context-item-info-title"]') ||
+                              document.querySelector("a[href*='/album/']");
+              album = pickText(albumEl);
+            }
+            if (!artwork) {
+              const imgEl = document.querySelector('img[aria-label="Cover art"]') ||
+                            document.querySelector('img[alt*="Cover"]') ||
+                            document.querySelector('img[alt*="cover"]');
+              artwork = pickSrc(imgEl);
+            }
+
+            return [title, artist, album, artwork].join('|||');
           })();`;
           var res = tab.execute({javascript: js});
           return res || '';
@@ -1190,11 +1351,12 @@ final class NowPlayingManager: ObservableObject {
         guard let out = String(data: data, encoding: .utf8) else { return nil }
         let trimmed = out.trimmingCharacters(in: .whitespacesAndNewlines)
         let parts = trimmed.components(separatedBy: "|||")
-        if parts.count >= 3 {
+        if parts.count >= 4 {
             return BrowserWebInfo(
                 title: parts[0],
                 artist: parts[1],
-                artworkURL: parts[2]
+                album: parts[2],
+                artworkURL: parts[3]
             )
         }
         return nil
@@ -1203,6 +1365,10 @@ final class NowPlayingManager: ObservableObject {
     private static func artworkForWebMedia(pageURL: URL) async -> NSImage? {
         // Spotify oEmbed (no auth) -> thumbnail_url
         if pageURL.host?.contains("open.spotify.com") == true {
+            // Only accept track pages to avoid playlist/artist cover art.
+            if !pageURL.path.lowercased().contains("/track/") {
+                return nil
+            }
             if let imageURL = await oEmbedThumbnailURL(provider: "spotify", pageURL: pageURL),
                let img = await downloadImage(imageURL) {
                 return img
@@ -1735,10 +1901,49 @@ struct NotchView: View {
         return proc.terminationStatus == 0
     }
 
+    private func runAppleScriptWithOutput(_ script: String, language: String = "AppleScript") -> String? {
+        let proc = Process()
+        proc.launchPath = "/usr/bin/osascript"
+        if language == "JavaScript" {
+            proc.arguments = ["-l", "JavaScript", "-e", script]
+        } else {
+            proc.arguments = ["-e", script]
+        }
+        let outPipe = Pipe()
+        proc.standardOutput = outPipe
+        proc.standardError = Pipe()
+        do {
+            try proc.run()
+        } catch {
+            return nil
+        }
+        proc.waitUntilExit()
+        guard proc.terminationStatus == 0 else { return nil }
+        let data = outPipe.fileHandleForReading.readDataToEndOfFile()
+        return String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     private func sendPlaybackCommand(_ command: PlaybackCommand) {
         let appName = nowPlayingManager.nowPlayingAppName?.lowercased() ?? ""
         let fallback = nowPlayingManager.lastControllableSource ?? ""
         var handled = false
+
+        NowPlayingManager.appendDebugLog("CONTROL: cmd=\(command) app=\(appName) browser=\(nowPlayingManager.isBrowserSource) fallback=\(fallback) inputMon=\(NowPlayingManager.inputMonitoringAllowed()) ax=\(AXIsProcessTrusted())")
+
+        if nowPlayingManager.isBrowserSource || fallback == "browser-spotify" || appName.contains("brave")
+            || appName.contains("chrome") || appName.contains("edge") || appName.contains("safari") || appName.contains("arc") {
+            // Try in-page controls first (if browser allows JS from Apple Events), then fall back to media keys.
+            let browserHandled = runBrowserSpotifyCommand(command, appName: nowPlayingManager.nowPlayingAppName)
+            NowPlayingManager.appendDebugLog("CONTROL: browserHandled=\(browserHandled)")
+            if !browserHandled {
+                switch command {
+                case .playPause: sendMediaKey(16)
+                case .next: sendMediaKey(17)
+                case .previous: sendMediaKey(18)
+                }
+            }
+            return
+        }
 
         if appName.contains("spotify") {
             let script: String
@@ -1863,6 +2068,7 @@ struct NotchView: View {
                 if (count of windows) = 0 then return false
                 set theTab to current tab of front window
                 set result to do JavaScript "\(escapedJS)" in theTab
+                return result
             end tell
             """
         } else {
@@ -1871,10 +2077,12 @@ struct NotchView: View {
                 if (count of windows) = 0 then return false
                 set theTab to active tab of front window
                 set result to execute javascript "\(escapedJS)" in theTab
+                return result
             end tell
             """
         }
-        return runAppleScript(script)
+        let result = runAppleScriptWithOutput(script) ?? ""
+        return result.lowercased().contains("true")
     }
 
     private var miniPlayerControls: some View {
