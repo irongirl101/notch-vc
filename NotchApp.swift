@@ -204,6 +204,11 @@ final class NowPlayingManager: ObservableObject {
                     if Self.isBrowser(bundleID: app.bundleIdentifier, name: app.localizedName) {
                         self.maybeUpdateEligibilityFromBrave()
                     }
+
+                    // VOX can be the active audio session without MediaRemote metadata.
+                    if app.localizedName == "Vox" || app.localizedName == "VOX" || (app.bundleIdentifier?.contains("Vox") == true) {
+                        self.maybeUpdateArtworkFromVox()
+                    }
                 }
             }
             return
@@ -437,6 +442,16 @@ final class NowPlayingManager: ObservableObject {
                 self.lastTrackUpdateAt = Date()
             }
         }
+        let artBase64 = info.artworkBase64.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !artBase64.isEmpty, let data = Data(base64Encoded: artBase64), let image = NSImage(data: data) {
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.nowPlayingArtwork = image
+                self.cachedArtwork = image
+                self.lastArtworkUpdateAt = Date()
+            }
+            return
+        }
         let trackURLString = info.trackURL.trimmingCharacters(in: .whitespacesAndNewlines)
         let canTryEmbedded = !trackURLString.isEmpty && trackURLString != lastVoxTrackURL
         if canTryEmbedded {
@@ -490,24 +505,94 @@ final class NowPlayingManager: ObservableObject {
         let album: String
         let trackURL: String
         let playerState: Int
+        let artworkBase64: String
+    }
+
+    private static func voxAppPath() -> String? {
+        if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.coppertino.Vox") {
+            return url.path
+        }
+        if let running = NSRunningApplication.runningApplications(withBundleIdentifier: "com.coppertino.Vox").first,
+           let url = running.bundleURL {
+            return url.path
+        }
+        let fallback = "/Applications/VOX.app"
+        if FileManager.default.fileExists(atPath: fallback) {
+            return fallback
+        }
+        return nil
+    }
+
+    private static func jxaStringLiteral(_ s: String) -> String {
+        s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+    }
+
+    fileprivate static func voxJxaTarget() -> String {
+        if let path = voxAppPath() {
+            return "\"\(jxaStringLiteral(path))\""
+        }
+        return "\"Vox\""
     }
 
     private static func voxNowPlayingInfo() -> VoxInfo? {
         // Use JXA like voxctl's `vox.trackurl()` plus metadata.
+        guard let appPath = voxAppPath() else { return nil }
+        let appPathLiteral = jxaStringLiteral(appPath)
         let script = """
-        const vox = Application("Vox");
+        ObjC.import('Foundation');
+        const vox = Application("\(appPathLiteral)");
         try {
-          const state = vox.playerState();
+          const errors = [];
+          function safeCall(label, fn) {
+            try { return fn(); } catch (e) { errors.push(label + ":" + String(e)); return null; }
+          }
+          const state = safeCall("playerState", () => vox.playerState()) ?? 0;
+          const track = safeCall("track", () => vox.track()) ?? "";
+          const artist = safeCall("artist", () => vox.artist()) ?? "";
+          const album = safeCall("album", () => vox.album()) ?? "";
+          const trackurl = safeCall("trackUrl", () => vox.trackUrl()) ?? "";
+
+          let art = "";
+          const tiff = safeCall("tiffArtworkData", () => vox.tiffArtworkData());
+          if (tiff) {
+            try {
+              art = tiff.base64EncodedStringWithOptions(0).js;
+            } catch (e) {
+              try {
+                const data = ObjC.unwrap(tiff);
+                if (data && data.base64EncodedStringWithOptions) {
+                  art = data.base64EncodedStringWithOptions(0).js;
+                } else {
+                  errors.push("tiffArtworkData:unwrap:Unsupported type");
+                }
+              } catch (e2) {
+                errors.push("tiffArtworkData:unwrap:" + String(e2));
+              }
+            }
+          }
+          if (!art) {
+            const img = safeCall("artworkImage", () => vox.artworkImage());
+            if (img) {
+              try {
+                const tiff2 = img.TIFFRepresentation();
+                if (tiff2) {
+                  art = tiff2.base64EncodedStringWithOptions(0).js;
+                }
+              } catch (e) { errors.push("artworkImage:TIFF:" + String(e)); }
+            }
+          }
           const info = {
-            track: vox.track(),
-            artist: vox.artist(),
-            album: vox.album(),
-            trackurl: vox.trackurl(),
-            state: state
+            track: track,
+            artist: artist,
+            album: album,
+            trackurl: trackurl,
+            state: state,
+            artwork: art,
+            errors: errors
           };
           JSON.stringify(info);
         } catch (e) {
-          "";
+          JSON.stringify({ error: String(e) });
         }
         """
 
@@ -516,16 +601,38 @@ final class NowPlayingManager: ObservableObject {
         proc.arguments = ["-l", "JavaScript", "-e", script]
         let pipe = Pipe()
         proc.standardOutput = pipe
-        proc.standardError = Pipe()
+        let errPipe = Pipe()
+        proc.standardError = errPipe
         do { try proc.run() } catch { return nil }
         proc.waitUntilExit()
 
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
         guard let out = String(data: data, encoding: .utf8) else { return nil }
         let trimmed = out.trimmingCharacters(in: .whitespacesAndNewlines)
+        if proc.terminationStatus != 0 {
+            Self.appendDebugLog("VOX JXA exited with status \(proc.terminationStatus)")
+        }
+        if let err = String(data: errData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !err.isEmpty {
+            Self.appendDebugLog("VOX JXA stderr (status \(proc.terminationStatus)): \(err.prefix(500))")
+        }
+        if trimmed.isEmpty {
+            Self.appendDebugLog("VOX JXA returned empty output")
+        } else {
+            Self.appendDebugLog("VOX JXA output: \(trimmed.prefix(500))")
+        }
         guard let jsonData = trimmed.data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any] else {
+            Self.appendDebugLog("VOX JXA output was not valid JSON")
             return nil
+        }
+        if let err = obj["error"] as? String, !err.isEmpty {
+            Self.appendDebugLog("VOX JXA error: \(err)")
+            return nil
+        }
+        if let errors = obj["errors"] as? [String], !errors.isEmpty {
+            Self.appendDebugLog("VOX JXA property errors: \(errors.joined(separator: " | "))")
         }
 
         return VoxInfo(
@@ -533,8 +640,26 @@ final class NowPlayingManager: ObservableObject {
             artist: (obj["artist"] as? String) ?? "",
             album: (obj["album"] as? String) ?? "",
             trackURL: (obj["trackurl"] as? String) ?? "",
-            playerState: (obj["state"] as? Int) ?? 0
+            playerState: (obj["state"] as? Int) ?? 0,
+            artworkBase64: (obj["artwork"] as? String) ?? ""
         )
+    }
+
+    private static func appendDebugLog(_ message: String) {
+        let ts = ISO8601DateFormatter().string(from: Date())
+        let line = "[\(ts)] \(message)\n"
+        let url = URL(fileURLWithPath: "/tmp/notch-vox-debug.log")
+        if let data = line.data(using: .utf8) {
+            if FileManager.default.fileExists(atPath: url.path) {
+                if let handle = try? FileHandle(forWritingTo: url) {
+                    defer { try? handle.close() }
+                    try? handle.seekToEnd()
+                    try? handle.write(contentsOf: data)
+                }
+            } else {
+                try? data.write(to: url, options: .atomic)
+            }
+        }
     }
 
     private static func embeddedArtwork(for url: URL) async -> NSImage? {
@@ -991,21 +1116,22 @@ struct NotchView: View {
 
     private var miniPlayerSubtitle: String {
         let recent = Date().timeIntervalSince(nowPlayingManager.lastTrackUpdateAt) < 5.0
-        if let artist = nowPlayingManager.trackArtist,
-           !artist.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return artist
+        let artist = nowPlayingManager.trackArtist?.trimmingCharacters(in: .whitespacesAndNewlines) ??
+            (recent ? nowPlayingManager.cachedTrackArtist?.trimmingCharacters(in: .whitespacesAndNewlines) : nil)
+        let album = nowPlayingManager.trackAlbum?.trimmingCharacters(in: .whitespacesAndNewlines) ??
+            (recent ? nowPlayingManager.cachedTrackAlbum?.trimmingCharacters(in: .whitespacesAndNewlines) : nil)
+
+        let hasArtist = (artist?.isEmpty == false)
+        let hasAlbum = (album?.isEmpty == false)
+
+        if hasArtist && hasAlbum {
+            return "\(artist!) • Album: \(album!)"
         }
-        if recent, let cached = nowPlayingManager.cachedTrackArtist,
-           !cached.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return cached
+        if hasAlbum {
+            return "Album: \(album!)"
         }
-        if let album = nowPlayingManager.trackAlbum,
-           !album.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return album
-        }
-        if recent, let cached = nowPlayingManager.cachedTrackAlbum,
-           !cached.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return cached
+        if hasArtist {
+            return artist!
         }
         return nowPlayingManager.isPlaying ? "Audio source" : "Hover to play something"
     }
@@ -1115,14 +1241,15 @@ struct NotchView: View {
             }
             handled = runAppleScript(script)
         } else if appName.contains("vox") {
+            let voxTarget = NowPlayingManager.voxJxaTarget()
             let script: String
             switch command {
             case .playPause:
-                script = "const vox = Application(\"Vox\"); try { vox.playpause(); } catch (e) {}"
+                script = "const vox = Application(\(voxTarget)); try { vox.playpause(); } catch (e) {}"
             case .next:
-                script = "const vox = Application(\"Vox\"); try { vox.next(); } catch (e) {}"
+                script = "const vox = Application(\(voxTarget)); try { vox.next(); } catch (e) {}"
             case .previous:
-                script = "const vox = Application(\"Vox\"); try { vox.previous(); } catch (e) {}"
+                script = "const vox = Application(\(voxTarget)); try { vox.previous(); } catch (e) {}"
             }
             handled = runAppleScript(script, language: "JavaScript")
         } else if appName.contains("brave") || fallback == "brave-spotify" {
@@ -1144,14 +1271,15 @@ struct NotchView: View {
             }
             handled = runAppleScript(script)
         } else if fallback == "vox" {
+            let voxTarget = NowPlayingManager.voxJxaTarget()
             let script: String
             switch command {
             case .playPause:
-                script = "const vox = Application(\"Vox\"); try { vox.playpause(); } catch (e) {}"
+                script = "const vox = Application(\(voxTarget)); try { vox.playpause(); } catch (e) {}"
             case .next:
-                script = "const vox = Application(\"Vox\"); try { vox.next(); } catch (e) {}"
+                script = "const vox = Application(\(voxTarget)); try { vox.next(); } catch (e) {}"
             case .previous:
-                script = "const vox = Application(\"Vox\"); try { vox.previous(); } catch (e) {}"
+                script = "const vox = Application(\(voxTarget)); try { vox.previous(); } catch (e) {}"
             }
             handled = runAppleScript(script, language: "JavaScript")
         }
