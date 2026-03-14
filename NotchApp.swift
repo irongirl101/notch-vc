@@ -278,7 +278,10 @@ final class NowPlayingManager: ObservableObject {
 
     private func pollFrontmostBrowserIfNeeded() {
         let front = NSWorkspace.shared.frontmostApplication
-        guard let browserApp = Self.browserAppName(bundleID: front?.bundleIdentifier, name: front?.localizedName) else { return }
+        let frontBrowser = Self.browserAppName(bundleID: front?.bundleIdentifier, name: front?.localizedName)
+        let fallbackBrowser = (lastControllableSource == "browser-spotify" || isBrowserSource) ? lastBrowserAppName : nil
+        guard let browserApp = frontBrowser ?? fallbackBrowser else { return }
+
         self.isBrowserSource = true
         self.maybeUpdateEligibilityFromBrowser(appName: browserApp)
         self.maybeUpdateArtworkFromBrowserActiveTab(appName: browserApp)
@@ -542,6 +545,7 @@ final class NowPlayingManager: ObservableObject {
         // Fast path: use the tab title (does not require JS from Apple Events).
         if let title = Self.browserActiveTabTitle(appName: appName),
            let parsed = Self.parseSpotifyTabTitle(title) {
+            Self.appendDebugLog("BROWSER: tab title parsed (fast): \(parsed.title) / \(parsed.artist)")
             let key = "tabtitle|\(parsed.title)|\(parsed.artist)"
             if key != lastBraveTitleKey {
                 lastBraveTitleKey = key
