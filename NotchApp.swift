@@ -158,32 +158,57 @@ final class NowPlayingManager: ObservableObject {
         // Always poll the frontmost browser for metadata (web players may not show up in CoreAudio/MR).
         pollFrontmostBrowserIfNeeded()
 
+        Self.appendDebugLog("REFRESH: starting")
+
         // 1) Try MediaRemote first (best signal when available)
         if let mrGetIsPlaying, let mrGetPID, let mrGetNowPlayingInfo {
+            Self.appendDebugLog("REFRESH: trying MediaRemote")
             mrGetIsPlaying(queue) { [weak self] playing in
                 guard let self else { return }
+                Self.appendDebugLog("REFRESH: MR playing=\(playing)")
                 self.isPlaying = playing
 
                 guard playing else {
-                    // Fall through to CoreAudio below (some systems report playing=false even when audio is active).
-                    if self.shouldPreserveVoxArtwork() {
-                        // Keep Vox metadata visible even when paused.
-                        self.isPlaying = (self.lastVoxPlayerState == 1)
-                        // Still poll Vox so metadata can update while paused.
-                        self.maybeUpdateArtworkFromVox()
-                        return
-                    } else {
-                        if self.shouldPreserveBrowserState {
+                    Self.appendDebugLog("REFRESH: MR not playing, checking CoreAudio")
+                    // Check CoreAudio for actual audio source
+                    self.updateFromCoreAudio()
+                    
+                    // If no eligible source found, preserve recent states or use Vox directly.
+                    if !self.isEligibleSource {
+                        Self.appendDebugLog("REFRESH: no eligible source, checking preserves")
+
+                        // If Vox is running, treat it as the active source even if CoreAudio doesn't expose it.
+                        if Self.isVoxRunning() {
+                            Self.appendDebugLog("REFRESH: Vox running, polling Vox metadata")
+                            self.isEligibleSource = true
+                            self.lastControllableSource = "vox"
+                            self.nowPlayingAppName = "Vox"
+                            if let app = NSRunningApplication.runningApplications(withBundleIdentifier: "com.coppertino.Vox").first,
+                               let icon = app.icon?.withMinimalistColors() {
+                                self.nowPlayingAppIcon = icon
+                                self.nowPlayingAppIconSmall = Self.scaledImage(icon, size: CGSize(width: 20, height: 20))
+                            }
+                            self.maybeUpdateArtworkFromVox()
+                        } else if self.shouldPreserveVoxArtwork() {
+                            Self.appendDebugLog("REFRESH: preserving Vox")
+                            // Keep Vox metadata visible even when paused.
+                            self.isPlaying = (self.lastVoxPlayerState == 1)
+                            // Still poll Vox so metadata can update while paused.
+                            self.maybeUpdateArtworkFromVox()
+                        } else if self.shouldPreserveBrowserState {
+                            Self.appendDebugLog("REFRESH: preserving browser")
                             self.isPlaying = true
-                            return
+                        } else {
+                            Self.appendDebugLog("REFRESH: clearing UI")
+                            // Clear UI when no active source
+                            self.nowPlayingArtwork = nil
+                            self.cachedArtwork = nil
+                            self.trackTitle = nil
+                            self.trackArtist = nil
+                            self.trackAlbum = nil
                         }
-                        self.nowPlayingArtwork = nil
-                        self.cachedArtwork = nil
-                        self.trackTitle = nil
-                        self.trackArtist = nil
-                        self.trackAlbum = nil
-                        self.isEligibleSource = false
-                        self.updateFromCoreAudio()
+                    } else {
+                        Self.appendDebugLog("REFRESH: found eligible source: \(self.nowPlayingAppName ?? "unknown")")
                     }
                     return
                 }
@@ -273,6 +298,7 @@ final class NowPlayingManager: ObservableObject {
         }
 
         // 2) Fallback: CoreAudio process list
+        Self.appendDebugLog("REFRESH: MediaRemote not available, using CoreAudio")
         updateFromCoreAudio()
     }
 
@@ -303,16 +329,20 @@ final class NowPlayingManager: ObservableObject {
 
     private func updateFromCoreAudio() {
         let now = Date()
+        Self.appendDebugLog("CA: checking for audio PID")
         if let pid = Self.currentlyRunningOutputPID(),
            let app = NSRunningApplication(processIdentifier: pid) {
+            Self.appendDebugLog("CA: found PID \(pid), app \(app.localizedName ?? "unknown")")
             lastAudioSeenAt = Date()
             let bundleID = app.bundleIdentifier
             let sourceChanged = (bundleID != lastSourceBundleID)
             lastSourceBundleID = bundleID
 
             if isVoxSource(bundleID: bundleID, name: app.localizedName) {
+                Self.appendDebugLog("CA: Vox source detected")
                 self.isPlaying = (lastVoxPlayerState == 1)
             } else {
+                Self.appendDebugLog("CA: non-Vox source: \(app.localizedName ?? "unknown")")
                 self.isPlaying = true
             }
             if sourceChanged || self.nowPlayingAppIcon == nil {
@@ -360,6 +390,7 @@ final class NowPlayingManager: ObservableObject {
 
             // VOX local files: ask VOX for the track URL and extract embedded artwork.
             if app.localizedName == "Vox" || app.localizedName == "VOX" || (app.bundleIdentifier?.contains("Vox") == true) {
+                Self.appendDebugLog("CA: calling maybeUpdateArtworkFromVox")
                 self.maybeUpdateArtworkFromVox()
             } else {
                 if sourceChanged {
@@ -761,7 +792,12 @@ final class NowPlayingManager: ObservableObject {
         guard now.timeIntervalSince(lastVoxFetchAt) > 1.0 else { return }
         lastVoxFetchAt = now
 
-        guard let info = Self.voxNowPlayingInfo() else { return }
+        Self.appendDebugLog("VOX: maybeUpdateArtworkFromVox called")
+        guard let info = Self.voxNowPlayingInfo() else {
+            Self.appendDebugLog("VOX: voxNowPlayingInfo returned nil")
+            return
+        }
+        Self.appendDebugLog("VOX: got info - track:\(info.track) artist:\(info.artist) album:\(info.album) state:\(info.playerState) url:\(info.trackURL.prefix(80))")
         lastVoxPlayerState = info.playerState
         lastVoxInfoAt = Date()
         lastVoxActiveAt = Date()
@@ -883,6 +919,10 @@ final class NowPlayingManager: ObservableObject {
             return fallback
         }
         return nil
+    }
+
+    private static func isVoxRunning() -> Bool {
+        return !NSRunningApplication.runningApplications(withBundleIdentifier: "com.coppertino.Vox").isEmpty
     }
 
     private static func jxaStringLiteral(_ s: String) -> String {
@@ -1487,28 +1527,42 @@ final class NowPlayingManager: ObservableObject {
         )
 
         var dataSize: UInt32 = 0
-        guard AudioObjectGetPropertyDataSize(systemObjectID, &listAddr, 0, nil, &dataSize) == noErr else {
+        let sizeStatus = AudioObjectGetPropertyDataSize(systemObjectID, &listAddr, 0, nil, &dataSize)
+        if sizeStatus != noErr {
+            Self.appendDebugLog("CA: AudioObjectGetPropertyDataSize failed: \(sizeStatus)")
             return nil
         }
 
         let count = Int(dataSize) / MemoryLayout<AudioObjectID>.stride
+        Self.appendDebugLog("CA: processObject count = \(count)")
         guard count > 0 else { return nil }
 
         var processObjects = Array<AudioObjectID>(repeating: 0, count: count)
-        guard AudioObjectGetPropertyData(systemObjectID, &listAddr, 0, nil, &dataSize, &processObjects) == noErr else {
+        let dataStatus = AudioObjectGetPropertyData(systemObjectID, &listAddr, 0, nil, &dataSize, &processObjects)
+        if dataStatus != noErr {
+            Self.appendDebugLog("CA: AudioObjectGetPropertyData failed: \(dataStatus)")
             return nil
         }
 
-        // Prefer the first process we find that's actively running OUTPUT.
-        // (This matches the user-visible expectation in the common case: one app is producing sound.)
+        // Prefer the first eligible process we find that's actively running OUTPUT.
+        // If none eligible, fall back to the first one.
+        var firstPID: pid_t? = nil
+        var eligiblePID: pid_t? = nil
         for processObject in processObjects {
             if isProcessRunningOutput(processObject),
                let pid = pidForProcessObject(processObject) {
-                return pid
+                if firstPID == nil {
+                    firstPID = pid
+                }
+                if let app = NSRunningApplication(processIdentifier: pid),
+                   Self.isEligibleSource(bundleID: app.bundleIdentifier, name: app.localizedName) {
+                    eligiblePID = pid
+                    break // Prefer the first eligible one
+                }
             }
         }
-
-        return nil
+        Self.appendDebugLog("CA: output PIDs: first=\(firstPID ?? 0), eligible=\(eligiblePID ?? 0)")
+        return eligiblePID ?? firstPID
     }
 
     private static func pidForProcessObject(_ processObject: AudioObjectID) -> pid_t? {
@@ -1519,10 +1573,16 @@ final class NowPlayingManager: ObservableObject {
         )
         var pid: pid_t = 0
         var size = UInt32(MemoryLayout<pid_t>.size)
-        guard AudioObjectGetPropertyData(processObject, &addr, 0, nil, &size, &pid) == noErr else {
+        let status = AudioObjectGetPropertyData(processObject, &addr, 0, nil, &size, &pid)
+        if status != noErr {
+            Self.appendDebugLog("CA: pidForProcessObject failed (status=\(status))")
             return nil
         }
-        return pid > 0 ? pid : nil
+        if pid <= 0 {
+            Self.appendDebugLog("CA: pidForProcessObject returned pid=\(pid)")
+            return nil
+        }
+        return pid
     }
 
     private static func isProcessRunningOutput(_ processObject: AudioObjectID) -> Bool {
