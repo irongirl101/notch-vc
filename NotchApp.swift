@@ -57,6 +57,7 @@ final class NowPlayingManager: ObservableObject {
     private var frontmostBundleID: String?
     private var frontmostAppName: String?
     private var lastFallbackArtworkURL: String?
+    private var lastFallbackWasSpotify: Bool = false
 
     private typealias MRRegisterFn = @convention(c) (DispatchQueue) -> Void
     private typealias MRGetPIDFn = @convention(c) (DispatchQueue, @escaping (Int32) -> Void) -> Void
@@ -250,9 +251,11 @@ final class NowPlayingManager: ObservableObject {
         }
 
         guard url.contains("spotify.com") else {
+            lastFallbackWasSpotify = false
             clearFallback()
             return
         }
+        lastFallbackWasSpotify = true
 
         let parsed = parseSpotifyTitle(title)
         DispatchQueue.main.async {
@@ -291,7 +294,12 @@ final class NowPlayingManager: ObservableObject {
 
     private func hasRecentFallback() -> Bool {
         if fallbackIsPlaying { return true }
+        if lastFallbackWasSpotify && isBraveRunning() { return true }
         return Date().timeIntervalSince(fallbackLastUpdateAt) < 10.0
+    }
+
+    private func isBraveRunning() -> Bool {
+        return NSRunningApplication.runningApplications(withBundleIdentifier: "com.brave.Browser").isEmpty == false
     }
 
     private func clearFallback() {
@@ -456,10 +464,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         
         // Since the user already has a physical MacBook notch, our software notch needs to be wider 
         // to extend past it and show the battery text on the side. 
-        let notchWidth: CGFloat = 330
-        let notchHeight: CGFloat = 34
+        let notchWidth: CGFloat = 370
+        let notchHeight: CGFloat = 33
         
-        let expandedWidth: CGFloat = 520
+        let expandedWidth: CGFloat = (screenRect.width * 0.25) + 50
         let expandedHeight: CGFloat = 198
         
         // The *window* needs to be large enough to contain the *expanded* notch, even when it's small.
@@ -716,7 +724,7 @@ struct NotchView: View {
                     .foregroundColor(.white.opacity(0.7))
             }
         }
-        .frame(width: 80, height: 80)
+        .frame(width: 60, height: 60)
         .background(Color.white.opacity(0.08))
         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
         .overlay(
@@ -769,7 +777,11 @@ struct NotchView: View {
     }
 
     private var miniPlayerPanel: some View {
-        VStack(alignment: .leading, spacing: 4) {
+        let sidePadding: CGFloat = 20
+        let rightReserve: CGFloat = 80
+        let leftIconWidth: CGFloat = 20
+        let maxPanelWidth = max(180, expandedWidth - (sidePadding * 2) - rightReserve - leftIconWidth)
+        return VStack(alignment: .leading, spacing: 4) {
             miniPlayerArt
 
             if let albumName = miniPlayerAlbumName {
@@ -793,12 +805,12 @@ struct NotchView: View {
 
             miniPlayerControls
         }
-        .offset(x: -10, y: -6)
-        .padding(.vertical, 10)
-        .padding(.horizontal, 12)
+        .offset(x: -6, y: 4)
+        .padding(.vertical, 14)
+        .padding(.horizontal, 10)
         .background(Color.white.opacity(0.06))
         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-        .frame(maxWidth: 300, maxHeight: expandedHeight - 16, alignment: .topLeading)
+        .frame(maxWidth: maxPanelWidth, maxHeight: expandedHeight - 4, alignment: .topLeading)
     }
 
     private var browserPermissionPanel: some View {
@@ -865,7 +877,7 @@ struct NotchView: View {
     }
 
     private var barsView: some View {
-        HStack(alignment: .bottom, spacing: 2) {
+        return HStack(alignment: .bottom, spacing: 2) {
             VisualizerBar(delay: 0.0, min: 0.25, max: 0.95)
             VisualizerBar(delay: 0.12, min: 0.15, max: 0.85)
             VisualizerBar(delay: 0.24, min: 0.35, max: 1.0)
@@ -873,7 +885,6 @@ struct NotchView: View {
             VisualizerBar(delay: 0.48, min: 0.3, max: 0.8)
         }
         .frame(width: 20, height: 18, alignment: .bottom)
-        .offset(y: -1)
     }
 
     private var isFrontmostBrowser: Bool {
@@ -907,8 +918,10 @@ struct NotchView: View {
                                     VStack(alignment: .leading, spacing: 6) {
                                         if nowPlayingManager.effectiveIsPlaying {
                                             barsView
+                                                .offset(x: shouldShowPlayer ? 0 : -2, y: shouldShowPlayer ? -1 : -4)
                                         } else {
                                             appIconView
+                                                .offset(x: shouldShowPlayer ? 0 : -2, y: shouldShowPlayer ? 0 : -3)
                                         }
                                         miniPlayerPanel
                                         if false {
@@ -918,8 +931,10 @@ struct NotchView: View {
                                 } else {
                                     if nowPlayingManager.effectiveIsPlaying {
                                         barsView
+                                            .offset(x: shouldShowPlayer ? 0 : -2, y: shouldShowPlayer ? -1 : -4)
                                     } else {
                                         appIconView
+                                            .offset(x: shouldShowPlayer ? 0 : -2, y: shouldShowPlayer ? 0 : -3)
                                     }
                                 }
                             }
@@ -945,11 +960,12 @@ struct NotchView: View {
                             .buttonStyle(.plain)
                             .frame(height: 28, alignment: .center)
                             .padding(.top, 2)
+                            .offset(y: shouldShowPlayer ? 0 : -3)
                         }
                         // These paddings are tuned to sit inside the notch "corner" area.
-                        .padding(.top, 1)
-                        .padding(.leading, shouldShowPlayer ? 29 : 14)
-                        .padding(.trailing, shouldShowPlayer ? 29 : 14)
+                        .padding(.top, 4)
+                        .padding(.leading, shouldShowPlayer ? 20 : 18)
+                        .padding(.trailing, shouldShowPlayer ? 29 : 18)
                         .frame(
                             width: shouldShowPlayer ? expandedWidth : baseWidth,
                             height: shouldShowPlayer ? expandedHeight : baseHeight,
@@ -1019,6 +1035,29 @@ struct PulseRing: View {
                 withAnimation(
                     .easeOut(duration: 1.2)
                     .repeatForever(autoreverses: false)
+                    .delay(delay)
+                ) {
+                    animate = true
+                }
+            }
+    }
+}
+
+struct VisualizerBar: View {
+    let delay: Double
+    let min: CGFloat
+    let max: CGFloat
+    @State private var animate = false
+
+    var body: some View {
+        RoundedRectangle(cornerRadius: 1.5, style: .continuous)
+            .fill(Color.white.opacity(0.9))
+            .frame(width: 1.5, height: 18)
+            .scaleEffect(x: 1.0, y: animate ? max : min, anchor: .bottom)
+            .onAppear {
+                withAnimation(
+                    .easeInOut(duration: 0.65)
+                    .repeatForever(autoreverses: true)
                     .delay(delay)
                 ) {
                     animate = true
