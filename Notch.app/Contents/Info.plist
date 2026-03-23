@@ -6,6 +6,8 @@
     <string>NotchApp</string>
     <key>CFBundleIdentifier</key>
     <string>com.example.NotchApp</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundleName</key>
     <string>Notch</string>
     <key>CFBundlePackageType</key>

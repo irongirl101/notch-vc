@@ -8,6 +8,10 @@
 		<data>
 		2jmj7l5rSw0yVb/vlWAYkK/YBwk=
 		</data>
+		<key>Resources/AppIcon.icns</key>
+		<data>
+		QgiGH5LUo8Oe3DpK4bu8qjC1gaU=
+		</data>
 	</dict>
 	<key>files2</key>
 	<dict>
@@ -16,6 +20,13 @@
 			<key>hash2</key>
 			<data>
 			47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=
+			</data>
+		</dict>
+		<key>Resources/AppIcon.icns</key>
+		<dict>
+			<key>hash2</key>
+			<data>
+			vrxCEbdXYYebd3GbzP2jbTN4z+dlos9iU1GpPdnl7Ss=
 			</data>
 		</dict>
 	</dict>

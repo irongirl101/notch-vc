@@ -30,8 +30,9 @@ else
   swiftc -module-cache-path "${MODULE_CACHE_DIR}" -parse-as-library NotchApp.swift -o "${APP_MACOS_DIR}/NotchApp"
 fi
 
-# Copy Info.plist
+# Copy Info.plist and AppIcon
 cp Info.plist "${APP_BUNDLE}/Contents/Info.plist"
+cp AppIcon.icns "${APP_RESOURCES_DIR}/"
 
 # Add minimal PkgInfo (helps some launch/services tooling)
 echo -n "APPL????" > "${APP_BUNDLE}/Contents/PkgInfo"
