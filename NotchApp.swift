@@ -46,6 +46,8 @@ final class NowPlayingManager: ObservableObject {
     @Published var fallbackTrackArtist: String?
     @Published var fallbackAppName: String?
     @Published var fallbackAppIcon: NSImage?
+    @Published var fallbackArtwork: NSImage?
+    @Published var fallbackIsPlaying: Bool = false
     @Published var fallbackLastUpdateAt: Date = .distantPast
 
     private let bundle: CFBundle?
@@ -54,6 +56,7 @@ final class NowPlayingManager: ObservableObject {
     private var fallbackTimer: Timer?
     private var frontmostBundleID: String?
     private var frontmostAppName: String?
+    private var lastFallbackArtworkURL: String?
 
     private typealias MRRegisterFn = @convention(c) (DispatchQueue) -> Void
     private typealias MRGetPIDFn = @convention(c) (DispatchQueue, @escaping (Int32) -> Void) -> Void
@@ -172,9 +175,14 @@ final class NowPlayingManager: ObservableObject {
         return fallbackAppName
     }
 
+    var effectiveIsPlaying: Bool {
+        if hasMediaRemoteData { return isPlaying }
+        return fallbackIsPlaying
+    }
+
     var effectiveArtwork: NSImage? {
         if let a = nowPlayingArtwork { return a }
-        return nil
+        return fallbackArtwork
     }
 
     var effectiveAppIcon: NSImage? {
@@ -202,23 +210,45 @@ final class NowPlayingManager: ObservableObject {
 
     private func refreshBrowserFallback() {
         guard shouldUseBrowserFallback() else {
+            // Keep recent data visible when switching away from the browser.
+            if hasRecentFallback() { return }
             clearFallback()
             return
         }
 
-        guard let result = runAppleScript(browserNowPlayingScript()) else {
-            clearFallback()
-            return
+        var title = ""
+        var artist = ""
+        var artworkURL = ""
+        var url = ""
+        var playbackState = ""
+
+        if let rich = runAppleScript(browserNowPlayingRichScript()) {
+            let parts = rich.components(separatedBy: "|||")
+            if parts.count >= 6 {
+                title = parts[0]
+                artist = parts[1]
+                artworkURL = parts[3]
+                playbackState = parts[4]
+                url = parts[5]
+            }
         }
 
-        let parts = result.split(separator: "|", omittingEmptySubsequences: false)
-        if parts.count < 3 {
-            clearFallback()
-            return
+        if url.isEmpty {
+            guard let result = runAppleScript(browserNowPlayingScript()) else {
+                clearFallback()
+                return
+            }
+
+            let parts = result.split(separator: "|", omittingEmptySubsequences: false)
+            if parts.count < 3 {
+                clearFallback()
+                return
+            }
+
+            title = String(parts[0])
+            url = String(parts[2])
         }
 
-        let title = String(parts[0])
-        let url = String(parts[2])
         guard url.contains("spotify.com") else {
             clearFallback()
             return
@@ -226,18 +256,42 @@ final class NowPlayingManager: ObservableObject {
 
         let parsed = parseSpotifyTitle(title)
         DispatchQueue.main.async {
-            self.fallbackTrackTitle = parsed.title
-            self.fallbackTrackArtist = parsed.artist
+            self.fallbackTrackTitle = parsed.title ?? (title.isEmpty ? nil : title)
+            self.fallbackTrackArtist = parsed.artist ?? (artist.isEmpty ? nil : artist)
             self.fallbackAppName = "Spotify (Brave)"
             self.fallbackAppIcon = self.braveIcon()
+            if !playbackState.isEmpty {
+                self.fallbackIsPlaying = playbackState.lowercased() == "playing"
+            } else {
+                self.fallbackIsPlaying = !(title.isEmpty && artist.isEmpty && artworkURL.isEmpty)
+            }
             self.fallbackLastUpdateAt = Date()
         }
+
+        if !artworkURL.isEmpty, let artwork = URL(string: artworkURL) {
+            Task { [weak self] in
+                guard let self else { return }
+                if let img = await self.downloadImage(from: artwork) {
+                    await MainActor.run {
+                        self.fallbackArtwork = img
+                        self.fallbackLastUpdateAt = Date()
+                    }
+                }
+            }
+        }
+
+        fetchFallbackArtworkIfNeeded(pageURLString: url)
     }
 
     private func shouldUseBrowserFallback() -> Bool {
         let id = frontmostBundleID?.lowercased() ?? ""
         let name = frontmostAppName?.lowercased() ?? ""
-        return id.contains("brave") || name.contains("brave")
+        return id.contains("brave") || name.contains("brave") || hasRecentFallback()
+    }
+
+    private func hasRecentFallback() -> Bool {
+        if fallbackIsPlaying { return true }
+        return Date().timeIntervalSince(fallbackLastUpdateAt) < 10.0
     }
 
     private func clearFallback() {
@@ -246,6 +300,8 @@ final class NowPlayingManager: ObservableObject {
             self.fallbackTrackArtist = nil
             self.fallbackAppName = nil
             self.fallbackAppIcon = nil
+            self.fallbackArtwork = nil
+            self.fallbackIsPlaying = false
         }
     }
 
@@ -261,12 +317,84 @@ final class NowPlayingManager: ObservableObject {
         """
     }
 
+    private func browserNowPlayingRichScript() -> String {
+        let js = """
+        (function(){
+          const ms = (navigator.mediaSession && navigator.mediaSession.metadata) ? navigator.mediaSession.metadata : null;
+          const playback = (navigator.mediaSession && navigator.mediaSession.playbackState) ? navigator.mediaSession.playbackState : '';
+          const title = (ms && ms.title) ? ms.title : '';
+          const artist = (ms && ms.artist) ? ms.artist : '';
+          const album = (ms && ms.album) ? ms.album : '';
+          let artwork = '';
+          if (ms && ms.artwork && ms.artwork.length) {
+            const last = ms.artwork[ms.artwork.length - 1];
+            artwork = last && last.src ? last.src : '';
+          }
+          return [title, artist, album, artwork, playback].join('|||');
+        })();
+        """
+        let escaped = js
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+            .replacingOccurrences(of: "\n", with: "\\n")
+        return """
+        tell application "Brave Browser"
+            if (count of windows) = 0 then return ""
+            set theTab to active tab of front window
+            set theURL to URL of theTab
+            set result to execute javascript "\(escaped)" in theTab
+            return result & "|||" & theURL
+        end tell
+        """
+    }
+
     private func runAppleScript(_ source: String) -> String? {
         var error: NSDictionary?
         guard let script = NSAppleScript(source: source) else { return nil }
         let output = script.executeAndReturnError(&error)
         if error != nil { return nil }
         return output.stringValue
+    }
+
+    private func fetchFallbackArtworkIfNeeded(pageURLString: String) {
+        guard lastFallbackArtworkURL != pageURLString else { return }
+        lastFallbackArtworkURL = pageURLString
+
+        Task { [weak self] in
+            guard let self else { return }
+            guard let img = await self.spotifyOEmbedArtwork(pageURLString: pageURLString) else { return }
+            await MainActor.run {
+                self.fallbackArtwork = img
+                self.fallbackLastUpdateAt = Date()
+            }
+        }
+    }
+
+    private func spotifyOEmbedArtwork(pageURLString: String) async -> NSImage? {
+        guard let encoded = pageURLString.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+              let url = URL(string: "https://open.spotify.com/oembed?url=\(encoded)") else {
+            return nil
+        }
+        do {
+            let (data, _) = try await URLSession.shared.data(from: url)
+            if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let thumb = json["thumbnail_url"] as? String,
+               let thumbURL = URL(string: thumb) {
+                return await downloadImage(from: thumbURL)
+            }
+        } catch {
+            return nil
+        }
+        return nil
+    }
+
+    private func downloadImage(from url: URL) async -> NSImage? {
+        do {
+            let (data, _) = try await URLSession.shared.data(from: url)
+            return NSImage(data: data)
+        } catch {
+            return nil
+        }
     }
 
     private func parseSpotifyTitle(_ title: String) -> (title: String?, artist: String?) {
@@ -625,7 +753,7 @@ struct NotchView: View {
             Button {
                 sendPlaybackCommand(.playPause)
             } label: {
-                Image(systemName: nowPlayingManager.isPlaying ? "pause.fill" : "play.fill")
+                Image(systemName: nowPlayingManager.effectiveIsPlaying ? "pause.fill" : "play.fill")
                     .font(.system(size: 12, weight: .semibold))
             }
 
@@ -724,6 +852,30 @@ struct NotchView: View {
         .transaction { $0.animation = nil }
     }
 
+    private var pulseRingView: some View {
+        ZStack {
+            PulseRing(delay: 0.0)
+            PulseRing(delay: 0.45)
+            Circle()
+                .fill(Color.white.opacity(0.9))
+                .frame(width: 6, height: 6)
+        }
+        .frame(width: 20, height: 20, alignment: .center)
+        .offset(y: -2)
+    }
+
+    private var barsView: some View {
+        HStack(alignment: .bottom, spacing: 2) {
+            VisualizerBar(delay: 0.0, min: 0.25, max: 0.95)
+            VisualizerBar(delay: 0.12, min: 0.15, max: 0.85)
+            VisualizerBar(delay: 0.24, min: 0.35, max: 1.0)
+            VisualizerBar(delay: 0.36, min: 0.2, max: 0.9)
+            VisualizerBar(delay: 0.48, min: 0.3, max: 0.8)
+        }
+        .frame(width: 20, height: 18, alignment: .bottom)
+        .offset(y: -1)
+    }
+
     private var isFrontmostBrowser: Bool {
         let id = activeAppBundleID?.lowercased() ?? ""
         let n = activeAppName?.lowercased() ?? ""
@@ -732,6 +884,7 @@ struct NotchView: View {
     }
     
     var body: some View {
+        let shouldShowPlayer = isHovered
         // We place the expanding notch inside an invisible frame the exact size of the maximum window.
         // We align it to the top so it "drops down" strictly from the menu bar edge.
         ZStack(alignment: .top) {
@@ -742,24 +895,32 @@ struct NotchView: View {
                     .fill(Color.black)
                     .ignoresSafeArea()
                     .frame(
-                        width: isHovered ? expandedWidth : baseWidth,
-                        height: isHovered ? expandedHeight : baseHeight
+                        width: shouldShowPlayer ? expandedWidth : baseWidth,
+                        height: shouldShowPlayer ? expandedHeight : baseHeight
                     )
                     .overlay(
                         // Use edge-aligned layout (avoids layout cycles from .position())
                         HStack(alignment: .top) {
                             // Left: Active app icon
                             Group {
-                                if isHovered {
+                                if shouldShowPlayer {
                                     VStack(alignment: .leading, spacing: 6) {
-                                        appIconView
+                                        if nowPlayingManager.effectiveIsPlaying {
+                                            barsView
+                                        } else {
+                                            appIconView
+                                        }
                                         miniPlayerPanel
                                         if false {
                                             browserPermissionPanel
                                         }
                                     }
                                 } else {
-                                    appIconView
+                                    if nowPlayingManager.effectiveIsPlaying {
+                                        barsView
+                                    } else {
+                                        appIconView
+                                    }
                                 }
                             }
                             .padding(.top, 6)
@@ -787,11 +948,11 @@ struct NotchView: View {
                         }
                         // These paddings are tuned to sit inside the notch "corner" area.
                         .padding(.top, 1)
-                        .padding(.leading, isHovered ? 29 : 14)
-                        .padding(.trailing, isHovered ? 29 : 14)
+                        .padding(.leading, shouldShowPlayer ? 29 : 14)
+                        .padding(.trailing, shouldShowPlayer ? 29 : 14)
                         .frame(
-                            width: isHovered ? expandedWidth : baseWidth,
-                            height: isHovered ? expandedHeight : baseHeight,
+                            width: shouldShowPlayer ? expandedWidth : baseWidth,
+                            height: shouldShowPlayer ? expandedHeight : baseHeight,
                             alignment: .top
                         )
                     )
@@ -800,16 +961,18 @@ struct NotchView: View {
             // Trigger the animation whenever the mouse enters/leaves this specific shape
         .onHover { hovering in
             isHovered = hovering
-            onHoverChange(hovering)
-            if hovering {
-                nowPlayingManager.startFallbackPolling()
-            } else {
-                nowPlayingManager.stopFallbackPolling()
-            }
+                onHoverChange(hovering)
+                if hovering {
+                    nowPlayingManager.startFallbackPolling()
+                } else {
+                    if !nowPlayingManager.effectiveIsPlaying {
+                        nowPlayingManager.stopFallbackPolling()
+                    }
+                }
             if hovering && isFrontmostBrowser {
             }
         }
-            .animation(.spring(response: 0.35, dampingFraction: 0.65), value: isHovered)
+            .animation(.spring(response: 0.35, dampingFraction: 0.65), value: shouldShowPlayer)
             
         }
         .frame(width: expandedWidth, height: expandedHeight, alignment: .top)
@@ -825,6 +988,14 @@ struct NotchView: View {
                     updateActiveAppIcon()
                 }
             }
+            onHoverChange(isHovered)
+        }
+        .onChange(of: nowPlayingManager.effectiveIsPlaying) { _, playing in
+            if playing {
+                nowPlayingManager.startFallbackPolling()
+            } else if !isHovered {
+                nowPlayingManager.stopFallbackPolling()
+            }
         }
         .onDisappear {
             if let appActivationObserver {
@@ -832,6 +1003,27 @@ struct NotchView: View {
                 self.appActivationObserver = nil
             }
         }
+    }
+}
+
+struct PulseRing: View {
+    let delay: Double
+    @State private var animate = false
+
+    var body: some View {
+        Circle()
+            .stroke(Color.white.opacity(0.6), lineWidth: 1.5)
+            .scaleEffect(animate ? 1.0 : 0.4)
+            .opacity(animate ? 0.0 : 0.7)
+            .onAppear {
+                withAnimation(
+                    .easeOut(duration: 1.2)
+                    .repeatForever(autoreverses: false)
+                    .delay(delay)
+                ) {
+                    animate = true
+                }
+            }
     }
 }
 
