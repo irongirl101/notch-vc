@@ -42,10 +42,18 @@ final class NowPlayingManager: ObservableObject {
     @Published var trackAlbum: String?
     @Published var nowPlayingAppName: String?
     @Published var lastTrackUpdateAt: Date = .distantPast
+    @Published var fallbackTrackTitle: String?
+    @Published var fallbackTrackArtist: String?
+    @Published var fallbackAppName: String?
+    @Published var fallbackAppIcon: NSImage?
+    @Published var fallbackLastUpdateAt: Date = .distantPast
 
     private let bundle: CFBundle?
     private let queue = DispatchQueue.main
     private var observers: [NSObjectProtocol] = []
+    private var fallbackTimer: Timer?
+    private var frontmostBundleID: String?
+    private var frontmostAppName: String?
 
     private typealias MRRegisterFn = @convention(c) (DispatchQueue) -> Void
     private typealias MRGetPIDFn = @convention(c) (DispatchQueue, @escaping (Int32) -> Void) -> Void
@@ -139,6 +147,154 @@ final class NowPlayingManager: ObservableObject {
 
     func sendCommand(_ command: Int32) {
         _ = mrSendCommand?(command, nil)
+    }
+
+    var hasMediaRemoteData: Bool {
+        if let t = trackTitle, !t.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return true }
+        if let a = trackArtist, !a.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return true }
+        if let al = trackAlbum, !al.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return true }
+        if nowPlayingArtwork != nil { return true }
+        return isPlaying
+    }
+
+    var effectiveTrackTitle: String? {
+        if let t = trackTitle, !t.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return t }
+        return fallbackTrackTitle
+    }
+
+    var effectiveTrackArtist: String? {
+        if let a = trackArtist, !a.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return a }
+        return fallbackTrackArtist
+    }
+
+    var effectiveAppName: String? {
+        if let n = nowPlayingAppName, !n.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return n }
+        return fallbackAppName
+    }
+
+    var effectiveArtwork: NSImage? {
+        if let a = nowPlayingArtwork { return a }
+        return nil
+    }
+
+    var effectiveAppIcon: NSImage? {
+        if let icon = nowPlayingAppIconSmall ?? nowPlayingAppIcon { return icon }
+        return fallbackAppIcon
+    }
+
+    func setFrontmostApp(bundleID: String?, name: String?) {
+        frontmostBundleID = bundleID
+        frontmostAppName = name
+    }
+
+    func startFallbackPolling() {
+        if fallbackTimer != nil { return }
+        refreshBrowserFallback()
+        fallbackTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+            self?.refreshBrowserFallback()
+        }
+    }
+
+    func stopFallbackPolling() {
+        fallbackTimer?.invalidate()
+        fallbackTimer = nil
+    }
+
+    private func refreshBrowserFallback() {
+        guard shouldUseBrowserFallback() else {
+            clearFallback()
+            return
+        }
+
+        guard let result = runAppleScript(browserNowPlayingScript()) else {
+            clearFallback()
+            return
+        }
+
+        let parts = result.split(separator: "|", omittingEmptySubsequences: false)
+        if parts.count < 3 {
+            clearFallback()
+            return
+        }
+
+        let title = String(parts[0])
+        let url = String(parts[2])
+        guard url.contains("spotify.com") else {
+            clearFallback()
+            return
+        }
+
+        let parsed = parseSpotifyTitle(title)
+        DispatchQueue.main.async {
+            self.fallbackTrackTitle = parsed.title
+            self.fallbackTrackArtist = parsed.artist
+            self.fallbackAppName = "Spotify (Brave)"
+            self.fallbackAppIcon = self.braveIcon()
+            self.fallbackLastUpdateAt = Date()
+        }
+    }
+
+    private func shouldUseBrowserFallback() -> Bool {
+        let id = frontmostBundleID?.lowercased() ?? ""
+        let name = frontmostAppName?.lowercased() ?? ""
+        return id.contains("brave") || name.contains("brave")
+    }
+
+    private func clearFallback() {
+        DispatchQueue.main.async {
+            self.fallbackTrackTitle = nil
+            self.fallbackTrackArtist = nil
+            self.fallbackAppName = nil
+            self.fallbackAppIcon = nil
+        }
+    }
+
+    private func browserNowPlayingScript() -> String {
+        return """
+        tell application "Brave Browser"
+            if (count of windows) = 0 then return ""
+            set theTab to active tab of front window
+            set theTitle to title of theTab
+            set theURL to URL of theTab
+            return theTitle & "||" & theURL
+        end tell
+        """
+    }
+
+    private func runAppleScript(_ source: String) -> String? {
+        var error: NSDictionary?
+        guard let script = NSAppleScript(source: source) else { return nil }
+        let output = script.executeAndReturnError(&error)
+        if error != nil { return nil }
+        return output.stringValue
+    }
+
+    private func parseSpotifyTitle(_ title: String) -> (title: String?, artist: String?) {
+        var cleaned = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        cleaned = cleaned.replacingOccurrences(of: " - Spotify", with: "")
+        cleaned = cleaned.replacingOccurrences(of: " – Spotify", with: "")
+        cleaned = cleaned.replacingOccurrences(of: " | Spotify", with: "")
+
+        if cleaned.contains(" • ") {
+            let parts = cleaned.components(separatedBy: " • ")
+            if parts.count == 2 {
+                return (title: parts[0], artist: parts[1])
+            }
+        }
+        if cleaned.contains(" - ") {
+            let parts = cleaned.components(separatedBy: " - ")
+            if parts.count == 2 {
+                return (title: parts[0], artist: parts[1])
+            }
+        }
+        return (title: cleaned.isEmpty ? nil : cleaned, artist: nil)
+    }
+
+    private func braveIcon() -> NSImage? {
+        guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: "com.brave.Browser").first else {
+            return nil
+        }
+        return app.icon
     }
 }
 
@@ -328,6 +484,7 @@ struct NotchView: View {
             self.activeAppIcon = icon
             self.activeAppName = app?.localizedName
             self.activeAppBundleID = app?.bundleIdentifier
+            self.nowPlayingManager.setFrontmostApp(bundleID: app?.bundleIdentifier, name: app?.localizedName)
         }
     }
     
@@ -389,15 +546,15 @@ struct NotchView: View {
     }
 
     private var miniPlayerTitle: String {
-        if let title = nowPlayingManager.trackTitle,
+        if let title = nowPlayingManager.effectiveTrackTitle,
            !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             return title
         }
-        if let appName = nowPlayingManager.nowPlayingAppName,
+        if let appName = nowPlayingManager.effectiveAppName,
            !appName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             return appName
         }
-        return nowPlayingManager.isPlaying ? "Now Playing" : "Nothing Playing"
+        return nowPlayingManager.hasMediaRemoteData ? "Now Playing" : "Nothing Playing"
     }
 
     private var miniPlayerAlbumName: String? {
@@ -409,7 +566,7 @@ struct NotchView: View {
     }
 
     private var miniPlayerArtistName: String? {
-        let artist = nowPlayingManager.trackArtist?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let artist = nowPlayingManager.effectiveTrackArtist?.trimmingCharacters(in: .whitespacesAndNewlines)
         if let artist, !artist.isEmpty {
             return artist
         }
@@ -418,8 +575,8 @@ struct NotchView: View {
 
     private var miniPlayerArt: some View {
         Group {
-            let art = nowPlayingManager.nowPlayingArtwork
-            if let image = art ?? nowPlayingManager.nowPlayingAppIcon ?? activeAppIcon {
+            let art = nowPlayingManager.effectiveArtwork
+            if let image = art ?? nowPlayingManager.effectiveAppIcon ?? activeAppIcon {
                 Image(nsImage: image)
                     .resizable()
                     .scaledToFill()
@@ -641,12 +798,17 @@ struct NotchView: View {
             }
             .offset(y: 1)
             // Trigger the animation whenever the mouse enters/leaves this specific shape
-            .onHover { hovering in
-                isHovered = hovering
-                onHoverChange(hovering)
-                if hovering && isFrontmostBrowser {
-                }
+        .onHover { hovering in
+            isHovered = hovering
+            onHoverChange(hovering)
+            if hovering {
+                nowPlayingManager.startFallbackPolling()
+            } else {
+                nowPlayingManager.stopFallbackPolling()
             }
+            if hovering && isFrontmostBrowser {
+            }
+        }
             .animation(.spring(response: 0.35, dampingFraction: 0.65), value: isHovered)
             
         }
