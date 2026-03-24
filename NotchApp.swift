@@ -780,37 +780,40 @@ struct NotchView: View {
         let sidePadding: CGFloat = 20
         let rightReserve: CGFloat = 80
         let leftIconWidth: CGFloat = 20
-        let maxPanelWidth = max(180, expandedWidth - (sidePadding * 2) - rightReserve - leftIconWidth)
+        let calculatedWidth = max(180, expandedWidth - (sidePadding * 2) - rightReserve - leftIconWidth)
+        let maxPanelWidth = min(135, calculatedWidth)
+        let idleOtherApp = !nowPlayingManager.effectiveIsPlaying && !isFrontmostBrowser
+        let verticalPadding: CGFloat = idleOtherApp ? 24 : 14
         return VStack(alignment: .leading, spacing: 4) {
             miniPlayerArt
 
-            if let albumName = miniPlayerAlbumName {
-                Text(albumName)
-                    .font(.system(size: 10, weight: .regular, design: .rounded))
-                    .foregroundColor(.white.opacity(0.7))
-                    .lineLimit(1)
-            }
+            let albumName = miniPlayerAlbumName
+            Text(albumName ?? " ")
+                .font(.system(size: 10, weight: .regular, design: .rounded))
+                .foregroundColor(.white.opacity(0.7))
+                .lineLimit(1)
+                .opacity(albumName == nil ? 0 : 1)
 
             Text(miniPlayerTitle)
                 .font(.system(size: 12, weight: .semibold, design: .rounded))
                 .foregroundColor(.white)
                 .lineLimit(1)
 
-            if let artistName = miniPlayerArtistName {
-                Text(artistName)
-                    .font(.system(size: 10, weight: .regular, design: .rounded))
-                    .foregroundColor(.white.opacity(0.65))
-                    .lineLimit(1)
-            }
+            let artistName = miniPlayerArtistName
+            Text(artistName ?? " ")
+                .font(.system(size: 10, weight: .regular, design: .rounded))
+                .foregroundColor(.white.opacity(0.65))
+                .lineLimit(1)
+                .opacity(artistName == nil ? 0 : 1)
 
             miniPlayerControls
         }
-        .offset(x: -6, y: 4)
-        .padding(.vertical, 14)
-        .padding(.horizontal, 10)
-        .background(Color.white.opacity(0.06))
-        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-        .frame(maxWidth: maxPanelWidth, maxHeight: expandedHeight - 4, alignment: .topLeading)
+            .offset(x: -6, y: 4)
+            .padding(.vertical, verticalPadding)
+            .padding(.horizontal, 10)
+            .background(Color.white.opacity(0.06))
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .frame(maxWidth: maxPanelWidth, maxHeight: expandedHeight - 4, alignment: .topLeading)
     }
 
     private var browserPermissionPanel: some View {
