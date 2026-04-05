@@ -40,6 +40,8 @@ final class NowPlayingManager: ObservableObject {
     @Published var trackTitle: String?
     @Published var trackArtist: String?
     @Published var trackAlbum: String?
+    @Published var trackElapsed: Double = 0
+    @Published var trackDuration: Double = 0
     @Published var nowPlayingAppName: String?
     @Published var lastTrackUpdateAt: Date = .distantPast
     @Published var fallbackTrackTitle: String?
@@ -137,6 +139,12 @@ final class NowPlayingManager: ObservableObject {
                     self.trackTitle = info["kMRMediaRemoteNowPlayingInfoTitle"] as? String
                     self.trackArtist = info["kMRMediaRemoteNowPlayingInfoArtist"] as? String
                     self.trackAlbum = info["kMRMediaRemoteNowPlayingInfoAlbum"] as? String
+                    if let elapsed = info["kMRMediaRemoteNowPlayingInfoElapsedTime"] as? Double {
+                        self.trackElapsed = elapsed
+                    }
+                    if let duration = info["kMRMediaRemoteNowPlayingInfoDuration"] as? Double {
+                        self.trackDuration = duration
+                    }
                     
                     if let artworkData = info["kMRMediaRemoteNowPlayingInfoArtworkData"] as? Data {
                         self.nowPlayingArtwork = NSImage(data: artworkData)
@@ -606,6 +614,8 @@ struct NotchView: View {
     
     @StateObject private var batteryManager = BatteryManager()
     @StateObject private var nowPlayingManager = NowPlayingManager()
+    @State private var outputDeviceName: String = ""
+    @State private var outputDeviceTimer: Timer?
     @State private var activeAppIcon: NSImage?
     @State private var activeAppName: String?
     @State private var activeAppBundleID: String?
@@ -781,39 +791,59 @@ struct NotchView: View {
         let rightReserve: CGFloat = 80
         let leftIconWidth: CGFloat = 20
         let calculatedWidth = max(180, expandedWidth - (sidePadding * 2) - rightReserve - leftIconWidth)
-        let maxPanelWidth = min(135, calculatedWidth)
-        let idleOtherApp = !nowPlayingManager.effectiveIsPlaying && !isFrontmostBrowser
-        let verticalPadding: CGFloat = idleOtherApp ? 24 : 14
-        return VStack(alignment: .leading, spacing: 4) {
-            miniPlayerArt
-
-            let albumName = miniPlayerAlbumName
-            Text(albumName ?? " ")
-                .font(.system(size: 10, weight: .regular, design: .rounded))
-                .foregroundColor(.white.opacity(0.7))
-                .lineLimit(1)
-                .opacity(albumName == nil ? 0 : 1)
-
-            Text(miniPlayerTitle)
-                .font(.system(size: 12, weight: .semibold, design: .rounded))
-                .foregroundColor(.white)
-                .lineLimit(1)
-
-            let artistName = miniPlayerArtistName
-            Text(artistName ?? " ")
-                .font(.system(size: 10, weight: .regular, design: .rounded))
-                .foregroundColor(.white.opacity(0.65))
-                .lineLimit(1)
-                .opacity(artistName == nil ? 0 : 1)
-
+        let maxPanelWidth = min(expandedWidth / 3.0, calculatedWidth)
+        let verticalPadding: CGFloat = 14
+        let outputName = outputDeviceName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let isPlaying = nowPlayingManager.effectiveIsPlaying
+        let stackSpacing: CGFloat = 6
+        return VStack(alignment: .leading, spacing: stackSpacing) {
+            HStack(alignment: .top, spacing: 10) {
+                miniPlayerArt
+                    .frame(width: 52, height: 52)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(miniPlayerTitle)
+                        .font(.system(size: 12, weight: .semibold, design: .rounded))
+                        .foregroundColor(.white)
+                        .lineLimit(2)
+                    let albumName = miniPlayerAlbumName
+                    if let albumName, !albumName.isEmpty {
+                        Text(albumName)
+                            .font(.system(size: 9, weight: .regular, design: .rounded))
+                            .foregroundColor(.white.opacity(0.7))
+                            .lineLimit(1)
+                    }
+                    let artistName = miniPlayerArtistName
+                    Text(artistName ?? " ")
+                        .font(.system(size: artistName == nil ? 9 : 10, weight: .regular, design: .rounded))
+                        .foregroundColor(.white.opacity(0.65))
+                        .lineLimit(1)
+                        .opacity(isPlaying ? (artistName == nil ? 0 : 1) : 0)
+                }
+            }
+            
             miniPlayerControls
+                .padding(.top, 4)
+                        
+            if !outputName.isEmpty {
+                HStack(spacing: 6) {
+                    Image(systemName: "speaker.wave.2.fill")
+                        .font(.system(size: 9, weight: .semibold))
+                    Text(outputName)
+                        .font(.system(size: 9, weight: .regular, design: .rounded))
+                        .lineLimit(1)
+                }
+                .foregroundColor(.white.opacity(0.55))
+                .padding(.top, 2)
+            }
         }
-            .offset(x: -6, y: 4)
-            .padding(.vertical, verticalPadding)
-            .padding(.horizontal, 10)
-            .background(Color.white.opacity(0.06))
-            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-            .frame(maxWidth: maxPanelWidth, maxHeight: expandedHeight - 4, alignment: .topLeading)
+        .offset(x: -6, y: -6)
+        .padding(.top, 14)
+        .padding(.vertical, verticalPadding)
+        .padding(.horizontal, 10)
+        .padding(.bottom, 4)
+        .background(Color.white.opacity(0.06))
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .frame(maxWidth: maxPanelWidth, maxHeight: expandedHeight - 4, alignment: .topLeading)
     }
 
     private var browserPermissionPanel: some View {
@@ -1008,6 +1038,10 @@ struct NotchView: View {
                 }
             }
             onHoverChange(isHovered)
+            updateOutputDeviceName()
+            outputDeviceTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { _ in
+                updateOutputDeviceName()
+            }
         }
         .onChange(of: nowPlayingManager.effectiveIsPlaying) { _, playing in
             if playing {
@@ -1021,7 +1055,67 @@ struct NotchView: View {
                 NSWorkspace.shared.notificationCenter.removeObserver(appActivationObserver)
                 self.appActivationObserver = nil
             }
+            outputDeviceTimer?.invalidate()
+            outputDeviceTimer = nil
         }
+    }
+
+    private var miniPlayerProgress: some View {
+        let duration = nowPlayingManager.trackDuration
+        let elapsed = nowPlayingManager.trackElapsed
+        let ratio = duration > 0 ? min(max(elapsed / duration, 0), 1) : 0
+        return ZStack(alignment: .leading) {
+            Capsule()
+                .fill(Color.white.opacity(0.15))
+                .frame(height: 2)
+            Capsule()
+                .fill(Color.white.opacity(0.7))
+                .frame(width: CGFloat(ratio) * max(1, 120), height: 2)
+        }
+        .frame(height: 2)
+    }
+
+    private func updateOutputDeviceName() {
+        if let name = Self.defaultOutputDeviceName() {
+            outputDeviceName = name
+        }
+    }
+
+    private static func defaultOutputDeviceName() -> String? {
+        var deviceID = AudioObjectID(0)
+        var size = UInt32(MemoryLayout<AudioObjectID>.size)
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        let status = AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject),
+            &address,
+            0,
+            nil,
+            &size,
+            &deviceID
+        )
+        if status != noErr { return nil }
+
+        var name: Unmanaged<CFString>? = nil
+        size = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+        var nameAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioObjectPropertyName,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        let status2 = AudioObjectGetPropertyData(
+            deviceID,
+            &nameAddress,
+            0,
+            nil,
+            &size,
+            &name
+        )
+        if status2 != noErr { return nil }
+        return name?.takeUnretainedValue() as String?
     }
 }
 
