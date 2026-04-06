@@ -260,6 +260,8 @@ final class NowPlayingManager: ObservableObject {
 
         guard url.contains("spotify.com") else {
             lastFallbackWasSpotify = false
+            // If Brave is still running, keep last known info rather than clearing.
+            if isBraveRunning() { return }
             clearFallback()
             return
         }
@@ -297,7 +299,7 @@ final class NowPlayingManager: ObservableObject {
     private func shouldUseBrowserFallback() -> Bool {
         let id = frontmostBundleID?.lowercased() ?? ""
         let name = frontmostAppName?.lowercased() ?? ""
-        return id.contains("brave") || name.contains("brave") || hasRecentFallback()
+        return id.contains("brave") || name.contains("brave") || hasRecentFallback() || isBraveRunning()
     }
 
     private func hasRecentFallback() -> Bool {
@@ -616,6 +618,9 @@ struct NotchView: View {
     @StateObject private var nowPlayingManager = NowPlayingManager()
     @State private var outputDeviceName: String = ""
     @State private var outputDeviceTimer: Timer?
+    @State private var runningApps: [NSRunningApplication] = []
+    @State private var appListTimer: Timer?
+    @State private var appListObserverTokens: [NSObjectProtocol] = []
     @State private var activeAppIcon: NSImage?
     @State private var activeAppName: String?
     @State private var activeAppBundleID: String?
@@ -632,6 +637,59 @@ struct NotchView: View {
             self.activeAppBundleID = app?.bundleIdentifier
             self.nowPlayingManager.setFrontmostApp(bundleID: app?.bundleIdentifier, name: app?.localizedName)
         }
+    }
+
+    private func updateRunningApps() {
+        let apps = NSWorkspace.shared.runningApplications
+            .filter { $0.activationPolicy == .regular || $0.activationPolicy == .accessory }
+            .filter { $0.bundleIdentifier != Bundle.main.bundleIdentifier }
+            .filter { $0.isTerminated == false }
+
+        // De-dupe by bundle id, prefer active instance
+        var seen: Set<String> = []
+        var deduped: [NSRunningApplication] = []
+        for app in apps {
+            let id = app.bundleIdentifier ?? "\(app.processIdentifier)"
+            if seen.contains(id) { continue }
+            seen.insert(id)
+            deduped.append(app)
+        }
+
+        DispatchQueue.main.async {
+            self.runningApps = deduped
+        }
+    }
+
+    private var appCarouselView: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                ForEach(runningApps, id: \.processIdentifier) { app in
+                    Button {
+                        app.activate()
+                    } label: {
+                        if let icon = app.icon {
+                            Image(nsImage: icon)
+                                .resizable()
+                                .scaledToFit()
+                        } else {
+                            Image(systemName: "app")
+                                .resizable()
+                                .scaledToFit()
+                                .foregroundColor(.white.opacity(0.7))
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .frame(width: 18, height: 18)
+                    .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+                }
+            }
+            .padding(.horizontal, 6)
+            .padding(.vertical, 4)
+        }
+        .frame(width: 120, height: 26)
+        .background(Color.white.opacity(0.05))
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .offset(y: 28)
     }
     
     private func batteryIconName(level: Int, isCharging: Bool) -> String {
@@ -974,6 +1032,11 @@ struct NotchView: View {
                             .padding(.top, 6)
                             
                             Spacer(minLength: 0)
+
+                            // Middle: App carousel
+                            if shouldShowPlayer {
+                                appCarouselView
+                            }
                             
                             // Right: Battery
                             Button {
@@ -1042,6 +1105,22 @@ struct NotchView: View {
             outputDeviceTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { _ in
                 updateOutputDeviceName()
             }
+            updateRunningApps()
+            appListTimer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { _ in
+                updateRunningApps()
+            }
+            let ws = NSWorkspace.shared.notificationCenter
+            appListObserverTokens = [
+                ws.addObserver(forName: NSWorkspace.didLaunchApplicationNotification, object: nil, queue: .main) { _ in
+                    updateRunningApps()
+                },
+                ws.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { _ in
+                    updateRunningApps()
+                },
+                ws.addObserver(forName: NSWorkspace.didTerminateApplicationNotification, object: nil, queue: .main) { _ in
+                    updateRunningApps()
+                }
+            ]
         }
         .onChange(of: nowPlayingManager.effectiveIsPlaying) { _, playing in
             if playing {
@@ -1057,6 +1136,12 @@ struct NotchView: View {
             }
             outputDeviceTimer?.invalidate()
             outputDeviceTimer = nil
+            appListTimer?.invalidate()
+            appListTimer = nil
+            for t in appListObserverTokens {
+                NSWorkspace.shared.notificationCenter.removeObserver(t)
+            }
+            appListObserverTokens = []
         }
     }
 
