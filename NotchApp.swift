@@ -40,25 +40,35 @@ final class NowPlayingManager: ObservableObject {
     @Published var trackTitle: String?
     @Published var trackArtist: String?
     @Published var trackAlbum: String?
+    @Published var trackReleaseYear: String?
+    @Published var trackQuality: String?
     @Published var trackElapsed: Double = 0
     @Published var trackDuration: Double = 0
     @Published var nowPlayingAppName: String?
     @Published var lastTrackUpdateAt: Date = .distantPast
     @Published var fallbackTrackTitle: String?
     @Published var fallbackTrackArtist: String?
+    @Published var fallbackTrackAlbum: String?
     @Published var fallbackAppName: String?
     @Published var fallbackAppIcon: NSImage?
     @Published var fallbackArtwork: NSImage?
     @Published var fallbackIsPlaying: Bool = false
+    @Published var fallbackPlaybackState: String = ""
     @Published var fallbackLastUpdateAt: Date = .distantPast
+    @Published var lastKnownTrackTitle: String?
+    @Published var lastKnownTrackArtist: String?
+    @Published var lastKnownTrackAlbum: String?
+    @Published var lastKnownArtwork: NSImage?
 
     private let bundle: CFBundle?
     private let queue = DispatchQueue.main
     private var observers: [NSObjectProtocol] = []
     private var fallbackTimer: Timer?
+    private var fallbackPollInterval: TimeInterval = 12.0
     private var frontmostBundleID: String?
     private var frontmostAppName: String?
     private var lastFallbackArtworkURL: String?
+    private var lastDirectFallbackArtworkURL: String?
     private var lastFallbackWasSpotify: Bool = false
 
     private typealias MRRegisterFn = @convention(c) (DispatchQueue) -> Void
@@ -148,8 +158,18 @@ final class NowPlayingManager: ObservableObject {
                     
                     if let artworkData = info["kMRMediaRemoteNowPlayingInfoArtworkData"] as? Data {
                         self.nowPlayingArtwork = NSImage(data: artworkData)
+                        self.lastKnownArtwork = self.nowPlayingArtwork
                     } else {
                         self.nowPlayingArtwork = nil
+                    }
+                    if let t = self.trackTitle, !t.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        self.lastKnownTrackTitle = t
+                    }
+                    if let a = self.trackArtist, !a.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        self.lastKnownTrackArtist = a
+                    }
+                    if let al = self.trackAlbum, !al.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        self.lastKnownTrackAlbum = al
                     }
                     self.lastTrackUpdateAt = Date()
                 }
@@ -171,12 +191,20 @@ final class NowPlayingManager: ObservableObject {
 
     var effectiveTrackTitle: String? {
         if let t = trackTitle, !t.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return t }
-        return fallbackTrackTitle
+        if let t = fallbackTrackTitle, !t.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return t }
+        return lastKnownTrackTitle
     }
 
     var effectiveTrackArtist: String? {
         if let a = trackArtist, !a.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return a }
-        return fallbackTrackArtist
+        if let a = fallbackTrackArtist, !a.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return a }
+        return lastKnownTrackArtist
+    }
+
+    var effectiveTrackAlbum: String? {
+        if let a = trackAlbum, !a.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return a }
+        if let a = fallbackTrackAlbum, !a.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return a }
+        return lastKnownTrackAlbum
     }
 
     var effectiveAppName: String? {
@@ -186,12 +214,16 @@ final class NowPlayingManager: ObservableObject {
 
     var effectiveIsPlaying: Bool {
         if hasMediaRemoteData { return isPlaying }
+        if !fallbackPlaybackState.isEmpty {
+            return fallbackPlaybackState.lowercased() == "playing"
+        }
         return fallbackIsPlaying
     }
 
     var effectiveArtwork: NSImage? {
         if let a = nowPlayingArtwork { return a }
-        return fallbackArtwork
+        if let a = fallbackArtwork { return a }
+        return lastKnownArtwork
     }
 
     var effectiveAppIcon: NSImage? {
@@ -204,10 +236,16 @@ final class NowPlayingManager: ObservableObject {
         frontmostAppName = name
     }
 
-    func startFallbackPolling() {
-        if fallbackTimer != nil { return }
+    func startFallbackPolling(interval: TimeInterval = 12.0) {
+        let normalizedInterval = max(3.0, interval)
+        if let timer = fallbackTimer {
+            if abs(fallbackPollInterval - normalizedInterval) < 0.01 { return }
+            timer.invalidate()
+            fallbackTimer = nil
+        }
+        fallbackPollInterval = normalizedInterval
         refreshBrowserFallback()
-        fallbackTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+        fallbackTimer = Timer.scheduledTimer(withTimeInterval: normalizedInterval, repeats: true) { [weak self] _ in
             self?.refreshBrowserFallback()
         }
     }
@@ -223,6 +261,57 @@ final class NowPlayingManager: ObservableObject {
             if hasRecentFallback() { return }
             clearFallback()
             return
+        }
+
+        if let meta = runAppleScript(browserSpotifyTabMetadataScript()) {
+            let parts = meta.components(separatedBy: "|||")
+            if parts.count >= 6 {
+                let title = parts[0]
+                let artist = parts[1]
+                let album = parts[2]
+                let artworkURL = parts[3]
+                let playbackState = parts[4]
+                let url = parts[5]
+                if url.contains("spotify.com") {
+                    lastFallbackWasSpotify = true
+                    let parsed = parseSpotifyTitle(title)
+                    let newTitle = parsed.title ?? (title.isEmpty ? nil : title)
+                    let newArtist = parsed.artist ?? (artist.isEmpty ? nil : artist)
+                    let isTrackURL = url.contains("/track/")
+                    let hasMediaSession = !playbackState.isEmpty || !artworkURL.isEmpty
+                    let isPlayingFlag = playbackState.lowercased() == "playing"
+                    let generic = isGenericSpotifyTitle(newTitle)
+                    let shouldUpdateText = (newTitle != nil &&
+                        (newArtist != nil || isTrackURL || hasMediaSession || isPlayingFlag) &&
+                        !(generic))
+                    DispatchQueue.main.async {
+                        if shouldUpdateText {
+                            self.fallbackTrackTitle = newTitle
+                            self.fallbackTrackArtist = newArtist
+                            if !album.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                self.fallbackTrackAlbum = album
+                                self.lastKnownTrackAlbum = album
+                            }
+                            if let t = newTitle, !t.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                self.lastKnownTrackTitle = t
+                            }
+                            if let a = newArtist, !a.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                self.lastKnownTrackArtist = a
+                            }
+                        }
+                        self.fallbackAppName = "Spotify (Brave)"
+                        self.fallbackAppIcon = self.braveIcon()
+                        if !playbackState.isEmpty {
+                            self.fallbackIsPlaying = playbackState.lowercased() == "playing"
+                            self.fallbackPlaybackState = playbackState
+                        }
+                        self.fallbackLastUpdateAt = Date()
+                    }
+                    fetchDirectFallbackArtworkIfNeeded(artworkURLString: artworkURL)
+                    fetchFallbackArtworkIfNeeded(pageURLString: url)
+                    return
+                }
+            }
         }
 
         var title = ""
@@ -258,6 +347,16 @@ final class NowPlayingManager: ObservableObject {
             url = String(parts[2])
         }
 
+        if !url.contains("spotify.com") {
+            // Try to find any Spotify tab in Brave and use that instead.
+            if let found = runAppleScript(browserFindSpotifyTabScript()) {
+                let parts = found.components(separatedBy: "|||")
+                if parts.count >= 2 {
+                    title = parts[0]
+                    url = parts[1]
+                }
+            }
+        }
         guard url.contains("spotify.com") else {
             lastFallbackWasSpotify = false
             // If Brave is still running, keep last known info rather than clearing.
@@ -268,30 +367,39 @@ final class NowPlayingManager: ObservableObject {
         lastFallbackWasSpotify = true
 
         let parsed = parseSpotifyTitle(title)
+        let newTitle = parsed.title ?? (title.isEmpty ? nil : title)
+        let newArtist = parsed.artist ?? (artist.isEmpty ? nil : artist)
+        let isTrackURL = url.contains("/track/")
+        let hasMediaSession = !playbackState.isEmpty || !artworkURL.isEmpty
+        let isPlayingFlag = playbackState.lowercased() == "playing"
+        let generic = isGenericSpotifyTitle(newTitle)
+        // Only accept updates when we have strong signals. Otherwise keep last known.
+        let shouldUpdateText = (newTitle != nil &&
+            (newArtist != nil || isTrackURL || hasMediaSession || isPlayingFlag) &&
+            !(generic))
         DispatchQueue.main.async {
-            self.fallbackTrackTitle = parsed.title ?? (title.isEmpty ? nil : title)
-            self.fallbackTrackArtist = parsed.artist ?? (artist.isEmpty ? nil : artist)
+            if shouldUpdateText {
+                self.fallbackTrackTitle = newTitle
+                self.fallbackTrackArtist = newArtist
+                if let t = newTitle, !t.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    self.lastKnownTrackTitle = t
+                }
+                if let a = newArtist, !a.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    self.lastKnownTrackArtist = a
+                }
+            }
             self.fallbackAppName = "Spotify (Brave)"
             self.fallbackAppIcon = self.braveIcon()
             if !playbackState.isEmpty {
                 self.fallbackIsPlaying = playbackState.lowercased() == "playing"
-            } else {
+                self.fallbackPlaybackState = playbackState
+            } else if shouldUpdateText {
                 self.fallbackIsPlaying = !(title.isEmpty && artist.isEmpty && artworkURL.isEmpty)
             }
             self.fallbackLastUpdateAt = Date()
         }
 
-        if !artworkURL.isEmpty, let artwork = URL(string: artworkURL) {
-            Task { [weak self] in
-                guard let self else { return }
-                if let img = await self.downloadImage(from: artwork) {
-                    await MainActor.run {
-                        self.fallbackArtwork = img
-                        self.fallbackLastUpdateAt = Date()
-                    }
-                }
-            }
-        }
+        fetchDirectFallbackArtworkIfNeeded(artworkURLString: artworkURL)
 
         fetchFallbackArtworkIfNeeded(pageURLString: url)
     }
@@ -312,15 +420,30 @@ final class NowPlayingManager: ObservableObject {
         return NSRunningApplication.runningApplications(withBundleIdentifier: "com.brave.Browser").isEmpty == false
     }
 
+    var prefersSpotifyControls: Bool {
+        if lastFallbackWasSpotify { return true }
+        if fallbackTrackTitle != nil && isBraveRunning() { return true }
+        return false
+    }
+
+    private func isGenericSpotifyTitle(_ title: String?) -> Bool {
+        guard let t = title?.lowercased().trimmingCharacters(in: .whitespacesAndNewlines),
+              !t.isEmpty else { return true }
+        return t.contains("spotify") || t.contains("stats for") || t.contains("view ") || t.contains("home") || t.contains("search")
+    }
+
     private func clearFallback() {
         DispatchQueue.main.async {
             self.fallbackTrackTitle = nil
             self.fallbackTrackArtist = nil
+            self.fallbackTrackAlbum = nil
             self.fallbackAppName = nil
             self.fallbackAppIcon = nil
             self.fallbackArtwork = nil
             self.fallbackIsPlaying = false
+            self.fallbackPlaybackState = ""
         }
+        lastDirectFallbackArtworkURL = nil
     }
 
     private func browserNowPlayingScript() -> String {
@@ -366,6 +489,99 @@ final class NowPlayingManager: ObservableObject {
         """
     }
 
+    private func browserFindSpotifyTabScript() -> String {
+        return """
+        tell application "Brave Browser"
+            if (count of windows) = 0 then return ""
+            -- First pass: prefer direct track URLs
+            repeat with w in windows
+                repeat with t in tabs of w
+                    try
+                        set theURL to URL of t
+                        if theURL contains "open.spotify.com/track/" then
+                            set theTitle to title of t
+                            return theTitle & "|||" & theURL
+                        end if
+                    end try
+                end repeat
+            end repeat
+            -- Second pass: any Spotify tab
+            repeat with w in windows
+                repeat with t in tabs of w
+                    try
+                        set theURL to URL of t
+                        if theURL contains "spotify.com" then
+                            set theTitle to title of t
+                            return theTitle & "|||" & theURL
+                        end if
+                    end try
+                end repeat
+            end repeat
+            return ""
+        end tell
+        """
+    }
+
+    private func browserSpotifyTabMetadataScript() -> String {
+        let js = """
+        (function(){
+          const ms = (navigator.mediaSession && navigator.mediaSession.metadata) ? navigator.mediaSession.metadata : null;
+          const title = (ms && ms.title) ? ms.title : '';
+          const artist = (ms && ms.artist) ? ms.artist : '';
+          const album = (ms && ms.album) ? ms.album : '';
+          let artwork = '';
+          if (ms && ms.artwork && ms.artwork.length) {
+            const last = ms.artwork[ms.artwork.length - 1];
+            artwork = last && last.src ? last.src : '';
+          }
+          let playback = (navigator.mediaSession && navigator.mediaSession.playbackState) ? navigator.mediaSession.playbackState : '';
+          if (!playback) {
+            const btn = document.querySelector('[data-testid="control-button-playpause"]') ||
+                        document.querySelector('button[aria-label="Play"]') ||
+                        document.querySelector('button[aria-label="Pause"]');
+            const label = btn ? (btn.getAttribute('aria-label') || '') : '';
+            if (label.toLowerCase().includes('play')) playback = 'paused';
+            if (label.toLowerCase().includes('pause')) playback = 'playing';
+          }
+          return [title, artist, album, artwork, playback].join('|||');
+        })();
+        """
+        let escaped = js
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+            .replacingOccurrences(of: "\n", with: "\\n")
+        return """
+        tell application "Brave Browser"
+            if (count of windows) = 0 then return ""
+            -- Prefer track tabs first
+            repeat with w in windows
+                repeat with t in tabs of w
+                    try
+                        set theURL to URL of t
+                        if theURL contains "open.spotify.com/track/" then
+                            set result to execute javascript "\(escaped)" in t
+                            return result & "|||" & theURL
+                        end if
+                    end try
+                end repeat
+            end repeat
+            -- Fall back to any Spotify tab
+            repeat with w in windows
+                repeat with t in tabs of w
+                    try
+                        set theURL to URL of t
+                        if theURL contains "spotify.com" then
+                            set result to execute javascript "\(escaped)" in t
+                            return result & "|||" & theURL
+                        end if
+                    end try
+                end repeat
+            end repeat
+            return ""
+        end tell
+        """
+    }
+
     private func runAppleScript(_ source: String) -> String? {
         var error: NSDictionary?
         guard let script = NSAppleScript(source: source) else { return nil }
@@ -383,6 +599,23 @@ final class NowPlayingManager: ObservableObject {
             guard let img = await self.spotifyOEmbedArtwork(pageURLString: pageURLString) else { return }
             await MainActor.run {
                 self.fallbackArtwork = img
+                self.fallbackLastUpdateAt = Date()
+            }
+        }
+    }
+
+    private func fetchDirectFallbackArtworkIfNeeded(artworkURLString: String) {
+        guard !artworkURLString.isEmpty else { return }
+        guard lastDirectFallbackArtworkURL != artworkURLString else { return }
+        lastDirectFallbackArtworkURL = artworkURLString
+        guard let artworkURL = URL(string: artworkURLString) else { return }
+
+        Task { [weak self] in
+            guard let self else { return }
+            guard let img = await self.downloadImage(from: artworkURL) else { return }
+            await MainActor.run {
+                self.fallbackArtwork = img
+                self.lastKnownArtwork = img
                 self.fallbackLastUpdateAt = Date()
             }
         }
@@ -621,11 +854,13 @@ struct NotchView: View {
     @State private var runningApps: [NSRunningApplication] = []
     @State private var appListTimer: Timer?
     @State private var appListObserverTokens: [NSObjectProtocol] = []
+    @State private var appIconCache: [pid_t: NSImage] = [:]
     @State private var activeAppIcon: NSImage?
     @State private var activeAppName: String?
     @State private var activeAppBundleID: String?
     @State private var isHovered = false
     @State private var appActivationObserver: NSObjectProtocol?
+    @AppStorage("batterySaverMode") private var batterySaverMode = true
     
     private func updateActiveAppIcon() {
         let app = NSWorkspace.shared.frontmostApplication
@@ -655,8 +890,20 @@ struct NotchView: View {
             deduped.append(app)
         }
 
+        let newIDs = deduped.map { $0.processIdentifier }
+        let currentIDs = runningApps.map { $0.processIdentifier }
+        if newIDs == currentIDs { return }
         DispatchQueue.main.async {
             self.runningApps = deduped
+            var newCache: [pid_t: NSImage] = [:]
+            for app in deduped {
+                if let existing = self.appIconCache[app.processIdentifier] {
+                    newCache[app.processIdentifier] = existing
+                } else if let icon = app.icon {
+                    newCache[app.processIdentifier] = icon
+                }
+            }
+            self.appIconCache = newCache
         }
     }
 
@@ -667,7 +914,7 @@ struct NotchView: View {
                     Button {
                         app.activate()
                     } label: {
-                        if let icon = app.icon {
+                        if let icon = appIconCache[app.processIdentifier] ?? app.icon {
                             Image(nsImage: icon)
                                 .resizable()
                                 .scaledToFit()
@@ -690,6 +937,7 @@ struct NotchView: View {
         .background(Color.white.opacity(0.05))
         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
         .offset(y: 28)
+        .transaction { $0.animation = nil }
     }
     
     private func batteryIconName(level: Int, isCharging: Bool) -> String {
@@ -762,7 +1010,7 @@ struct NotchView: View {
     }
 
     private var miniPlayerAlbumName: String? {
-        let album = nowPlayingManager.trackAlbum?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let album = nowPlayingManager.effectiveTrackAlbum?.trimmingCharacters(in: .whitespacesAndNewlines)
         if let album, !album.isEmpty {
             return album
         }
@@ -807,7 +1055,77 @@ struct NotchView: View {
         case previous
     }
 
+    private func runAppleScriptResult(_ source: String) -> String? {
+        var error: NSDictionary?
+        guard let script = NSAppleScript(source: source) else { return nil }
+        let output = script.executeAndReturnError(&error)
+        if error != nil { return nil }
+        return output.stringValue
+    }
+
+    private func runBrowserSpotifyCommand(_ command: PlaybackCommand) -> Bool {
+        let js: String
+        switch command {
+        case .playPause:
+            js = """
+            (function(){
+              const btn = document.querySelector('[data-testid="control-button-playpause"]') ||
+                          document.querySelector('button[aria-label="Play"]') ||
+                          document.querySelector('button[aria-label="Pause"]');
+              if (btn) { btn.click(); return true; }
+              return false;
+            })();
+            """
+        case .next:
+            js = """
+            (function(){
+              const btn = document.querySelector('[data-testid="control-button-skip-forward"]') ||
+                          document.querySelector('button[aria-label="Next"]');
+              if (btn) { btn.click(); return true; }
+              return false;
+            })();
+            """
+        case .previous:
+            js = """
+            (function(){
+              const btn = document.querySelector('[data-testid="control-button-skip-back"]') ||
+                          document.querySelector('button[aria-label="Previous"]');
+              if (btn) { btn.click(); return true; }
+              return false;
+            })();
+            """
+        }
+        let escaped = js
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+            .replacingOccurrences(of: "\n", with: "\\n")
+        let script = """
+        tell application "Brave Browser"
+            if (count of windows) = 0 then return "false"
+            repeat with w in windows
+                repeat with t in tabs of w
+                    try
+                        set theURL to URL of t
+                        if theURL contains "spotify.com" then
+                            set result to execute javascript "\(escaped)" in t
+                            return result
+                        end if
+                    end try
+                end repeat
+            end repeat
+            return "false"
+        end tell
+        """
+        let result = runAppleScriptResult(script) ?? "false"
+        return result.lowercased().contains("true")
+    }
+
     private func sendPlaybackCommand(_ command: PlaybackCommand) {
+        if nowPlayingManager.prefersSpotifyControls {
+            if runBrowserSpotifyCommand(command) {
+                return
+            }
+        }
         let cmd: Int32
         switch command {
         case .playPause: cmd = 2 // kMRTogglePlayPause
@@ -876,6 +1194,37 @@ struct NotchView: View {
                         .foregroundColor(.white.opacity(0.65))
                         .lineLimit(1)
                         .opacity(isPlaying ? (artistName == nil ? 0 : 1) : 0)
+
+                    if let timeText = miniPlayerTimeText {
+                        Text(timeText)
+                            .font(.system(size: 9, weight: .regular, design: .rounded))
+                            .foregroundColor(.white.opacity(0.55))
+                            .lineLimit(1)
+                    }
+
+                    if let year = nowPlayingManager.trackReleaseYear, !year.isEmpty {
+                        Text("Year \(year)")
+                            .font(.system(size: 9, weight: .regular, design: .rounded))
+                            .foregroundColor(.white.opacity(0.5))
+                            .lineLimit(1)
+                    } else {
+                        Text("Year —")
+                            .font(.system(size: 9, weight: .regular, design: .rounded))
+                            .foregroundColor(.white.opacity(0.35))
+                            .lineLimit(1)
+                    }
+
+                    if let quality = nowPlayingManager.trackQuality, !quality.isEmpty {
+                        Text("Quality \(quality)")
+                            .font(.system(size: 9, weight: .regular, design: .rounded))
+                            .foregroundColor(.white.opacity(0.5))
+                            .lineLimit(1)
+                    } else {
+                        Text("Quality —")
+                            .font(.system(size: 9, weight: .regular, design: .rounded))
+                            .foregroundColor(.white.opacity(0.35))
+                            .lineLimit(1)
+                    }
                 }
             }
             
@@ -978,11 +1327,35 @@ struct NotchView: View {
         .frame(width: 20, height: 18, alignment: .bottom)
     }
 
+    private var compactPlayingIndicator: some View {
+        Image(systemName: "waveform")
+            .font(.system(size: 11, weight: .semibold))
+            .foregroundColor(.white.opacity(0.9))
+            .frame(width: 20, height: 20, alignment: .center)
+            .offset(y: -2)
+    }
+
     private var isFrontmostBrowser: Bool {
         let id = activeAppBundleID?.lowercased() ?? ""
         let n = activeAppName?.lowercased() ?? ""
         return id.contains("brave") || id.contains("chrome") || id.contains("edge") || id.contains("safari") || id.contains("arc")
             || n.contains("brave") || n.contains("chrome") || n.contains("edge") || n.contains("safari") || n.contains("arc")
+    }
+
+    private func updateFallbackPollingForCurrentState() {
+        if isHovered {
+            nowPlayingManager.startFallbackPolling(interval: 5.0)
+            return
+        }
+        if batterySaverMode {
+            nowPlayingManager.stopFallbackPolling()
+            return
+        }
+        if nowPlayingManager.effectiveIsPlaying {
+            nowPlayingManager.startFallbackPolling(interval: 15.0)
+        } else {
+            nowPlayingManager.stopFallbackPolling()
+        }
     }
     
     var body: some View {
@@ -1021,7 +1394,7 @@ struct NotchView: View {
                                     }
                                 } else {
                                     if nowPlayingManager.effectiveIsPlaying {
-                                        barsView
+                                        compactPlayingIndicator
                                             .offset(x: shouldShowPlayer ? 0 : -2, y: shouldShowPlayer ? -1 : -4)
                                     } else {
                                         appIconView
@@ -1039,21 +1412,42 @@ struct NotchView: View {
                             }
                             
                             // Right: Battery
-                            Button {
-                                if let url = URL(string: "x-apple.systempreferences:com.apple.preference.battery") {
-                                    NSWorkspace.shared.open(url)
+                            HStack(spacing: 8) {
+                                if shouldShowPlayer {
+                                    Button {
+                                        batterySaverMode.toggle()
+                                        updateFallbackPollingForCurrentState()
+                                    } label: {
+                                        HStack(spacing: 4) {
+                                            Image(systemName: batterySaverMode ? "leaf.fill" : "leaf")
+                                                .font(.system(size: 9, weight: .semibold))
+                                            Text("Saver")
+                                                .font(.system(size: 9, weight: .semibold, design: .rounded))
+                                        }
+                                        .foregroundColor(batterySaverMode ? .green : .white.opacity(0.8))
+                                        .padding(.horizontal, 7)
+                                        .padding(.vertical, 4)
+                                        .background(Color.white.opacity(0.08))
+                                        .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+                                    }
+                                    .buttonStyle(.plain)
                                 }
-                            } label: {
-                                HStack(alignment: .center, spacing: 4) {
-                                    Text("\(batteryManager.batteryLevel)%")
-                                        .font(.system(size: 10, weight: .bold, design: .rounded))
-                                        .foregroundColor(.white)
-                                        .padding(.top, 1) // slight baseline adjustment
-                                    
-                                    batteryIconView
+                                Button {
+                                    if let url = URL(string: "x-apple.systempreferences:com.apple.preference.battery") {
+                                        NSWorkspace.shared.open(url)
+                                    }
+                                } label: {
+                                    HStack(alignment: .center, spacing: 4) {
+                                        Text("\(batteryManager.batteryLevel)%")
+                                            .font(.system(size: 10, weight: .bold, design: .rounded))
+                                            .foregroundColor(.white)
+                                            .padding(.top, 1) // slight baseline adjustment
+                                        
+                                        batteryIconView
+                                    }
                                 }
+                                .buttonStyle(.plain)
                             }
-                            .buttonStyle(.plain)
                             .frame(height: 28, alignment: .center)
                             .padding(.top, 2)
                             .offset(y: shouldShowPlayer ? 0 : -3)
@@ -1073,14 +1467,28 @@ struct NotchView: View {
             // Trigger the animation whenever the mouse enters/leaves this specific shape
         .onHover { hovering in
             isHovered = hovering
-                onHoverChange(hovering)
-                if hovering {
-                    nowPlayingManager.startFallbackPolling()
-                } else {
-                    if !nowPlayingManager.effectiveIsPlaying {
-                        nowPlayingManager.stopFallbackPolling()
+            onHoverChange(hovering)
+            if hovering {
+                nowPlayingManager.startFallbackPolling(interval: 5.0)
+                if appListTimer == nil {
+                    updateRunningApps()
+                    appListTimer = Timer.scheduledTimer(withTimeInterval: 8, repeats: true) { _ in
+                        updateRunningApps()
                     }
                 }
+                updateOutputDeviceName()
+                if outputDeviceTimer == nil {
+                    outputDeviceTimer = Timer.scheduledTimer(withTimeInterval: 20, repeats: true) { _ in
+                        updateOutputDeviceName()
+                    }
+                }
+            } else {
+                updateFallbackPollingForCurrentState()
+                appListTimer?.invalidate()
+                appListTimer = nil
+                outputDeviceTimer?.invalidate()
+                outputDeviceTimer = nil
+            }
             if hovering && isFrontmostBrowser {
             }
         }
@@ -1102,32 +1510,30 @@ struct NotchView: View {
             }
             onHoverChange(isHovered)
             updateOutputDeviceName()
-            outputDeviceTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { _ in
-                updateOutputDeviceName()
-            }
             updateRunningApps()
-            appListTimer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { _ in
-                updateRunningApps()
-            }
             let ws = NSWorkspace.shared.notificationCenter
             appListObserverTokens = [
                 ws.addObserver(forName: NSWorkspace.didLaunchApplicationNotification, object: nil, queue: .main) { _ in
-                    updateRunningApps()
-                },
-                ws.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { _ in
-                    updateRunningApps()
+                    if self.isHovered {
+                        updateRunningApps()
+                    }
                 },
                 ws.addObserver(forName: NSWorkspace.didTerminateApplicationNotification, object: nil, queue: .main) { _ in
-                    updateRunningApps()
+                    if self.isHovered {
+                        updateRunningApps()
+                    }
                 }
             ]
         }
         .onChange(of: nowPlayingManager.effectiveIsPlaying) { _, playing in
             if playing {
-                nowPlayingManager.startFallbackPolling()
+                updateFallbackPollingForCurrentState()
             } else if !isHovered {
                 nowPlayingManager.stopFallbackPolling()
             }
+        }
+        .onChange(of: batterySaverMode) { _, _ in
+            updateFallbackPollingForCurrentState()
         }
         .onDisappear {
             if let appActivationObserver {
@@ -1158,6 +1564,20 @@ struct NotchView: View {
                 .frame(width: CGFloat(ratio) * max(1, 120), height: 2)
         }
         .frame(height: 2)
+    }
+
+    private var miniPlayerTimeText: String? {
+        let duration = nowPlayingManager.trackDuration
+        if duration <= 0 { return nil }
+        let elapsed = max(0, nowPlayingManager.trackElapsed)
+        return "\(formatTime(elapsed)) / \(formatTime(duration))"
+    }
+
+    private func formatTime(_ seconds: Double) -> String {
+        let s = max(0, Int(seconds.rounded()))
+        let m = s / 60
+        let r = s % 60
+        return String(format: "%d:%02d", m, r)
     }
 
     private func updateOutputDeviceName() {
