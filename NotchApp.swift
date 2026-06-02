@@ -65,6 +65,7 @@ final class NowPlayingManager: ObservableObject {
     @Published var lastKnownTrackArtist: String?
     @Published var lastKnownTrackAlbum: String?
     @Published var lastKnownArtwork: NSImage?
+    @Published var isBrowserJSEnabled: Bool = true
 
     private let bundle: CFBundle?
     private let queue = DispatchQueue.main
@@ -136,7 +137,9 @@ final class NowPlayingManager: ObservableObject {
             }
         }
         refresh()
-        refreshBrowserFallback()
+        DispatchQueue.main.async { [weak self] in
+            self?.refreshBrowserFallback()
+        }
     }
 
     deinit {
@@ -363,7 +366,7 @@ final class NowPlayingManager: ObservableObject {
         }
 
         debugLog("[DEBUG] NowPlayingManager: refreshBrowserFallback - attempting browserSpotifyTabMetadataScript")
-        if let meta = runAppleScript(browserSpotifyTabMetadataScript()) {
+        if let meta = runAppleScript(browserSpotifyTabMetadataScript(), isJavaScript: true) {
             debugLog("[DEBUG] NowPlayingManager: refreshBrowserFallback - meta raw: \(meta)")
             let parts = meta.components(separatedBy: "|||")
             if parts.count >= 6 {
@@ -607,7 +610,7 @@ final class NowPlayingManager: ObservableObject {
                 set frontTab to tab frontIndex of front window
                 set frontURL to URL of frontTab
                 if frontURL contains "spotify.com" then
-                    set result to execute javascript "\(escaped)" in frontTab
+                    tell frontTab to set result to execute javascript "\(escaped)"
                     return result & "|||" & frontURL
                 end if
             end try
@@ -617,7 +620,7 @@ final class NowPlayingManager: ObservableObject {
                     try
                         set theURL to URL of t
                         if theURL contains "open.spotify.com/track/" then
-                            set result to execute javascript "\(escaped)" in t
+                            tell t to set result to execute javascript "\(escaped)"
                             return result & "|||" & theURL
                         end if
                     end try
@@ -629,7 +632,7 @@ final class NowPlayingManager: ObservableObject {
                     try
                         set theURL to URL of t
                         if theURL contains "spotify.com" then
-                            set result to execute javascript "\(escaped)" in t
+                            tell t to set result to execute javascript "\(escaped)"
                             return result & "|||" & theURL
                         end if
                     end try
@@ -683,13 +686,24 @@ final class NowPlayingManager: ObservableObject {
         """
     }
 
-    private func runAppleScript(_ source: String) -> String? {
+    private func runAppleScript(_ source: String, isJavaScript: Bool = false) -> String? {
         var error: NSDictionary?
         guard let script = NSAppleScript(source: source) else { return nil }
         let output = script.executeAndReturnError(&error)
         if let error = error {
             debugLog("[DEBUG] NowPlayingManager: AppleScript error: \(error)")
+            let errStr = "\(error)"
+            if isJavaScript && errStr.contains("-1723") {
+                DispatchQueue.main.async {
+                    self.isBrowserJSEnabled = false
+                }
+            }
             return nil
+        }
+        if isJavaScript {
+            DispatchQueue.main.async {
+                self.isBrowserJSEnabled = true
+            }
         }
         return output.stringValue
     }
@@ -1394,11 +1408,24 @@ struct NotchView: View {
         case previous
     }
 
-    private func runAppleScriptResult(_ source: String) -> String? {
+    private func runAppleScriptResult(_ source: String, isJavaScript: Bool = false) -> String? {
         var error: NSDictionary?
         guard let script = NSAppleScript(source: source) else { return nil }
         let output = script.executeAndReturnError(&error)
-        if error != nil { return nil }
+        if let error = error {
+            let errStr = "\(error)"
+            if isJavaScript && errStr.contains("-1723") {
+                DispatchQueue.main.async {
+                    self.nowPlayingManager.isBrowserJSEnabled = false
+                }
+            }
+            return nil
+        }
+        if isJavaScript {
+            DispatchQueue.main.async {
+                self.nowPlayingManager.isBrowserJSEnabled = true
+            }
+        }
         if let s = output.stringValue { return s }
         return output.description
     }
@@ -1489,7 +1516,7 @@ struct NotchView: View {
                 set frontTab to tab frontIndex of front window
                 set frontURL to URL of frontTab
                 if frontURL contains "spotify.com" then
-                    set result to execute javascript "\(escaped)" in frontTab
+                    tell frontTab to set result to execute javascript "\(escaped)"
                     return (result as text)
                 end if
             end try
@@ -1499,7 +1526,7 @@ struct NotchView: View {
                         set theURL to URL of t
                         if theURL contains "spotify.com" then
                             set active tab index of w to (index of t)
-                            set result to execute javascript "\(escaped)" in t
+                            tell t to set result to execute javascript "\(escaped)"
                             return (result as text)
                         end if
                     end try
@@ -1508,7 +1535,7 @@ struct NotchView: View {
             return "false"
         end tell
         """
-        let result = runAppleScriptResult(script) ?? "false"
+        let result = runAppleScriptResult(script, isJavaScript: true) ?? "false"
         return result.lowercased().contains("true")
     }
 
@@ -1587,41 +1614,46 @@ struct NotchView: View {
                 }
             }
             
-            ScrubbableProgressBar(elapsed: elapsed, duration: duration) { newTime in
-                seekToPosition(newTime)
-            }
-            .padding(.vertical, 2)
-            
-            HStack {
-                Text(formatTime(elapsed))
-                    .font(.system(size: 7, weight: .regular, design: .rounded))
-                    .foregroundColor(.white.opacity(0.4))
-                Spacer()
-                if duration > 0 {
-                    Text(formatTime(duration))
+            if nowPlayingManager.prefersSpotifyControls && !nowPlayingManager.isBrowserJSEnabled {
+                browserPermissionPanel
+                    .padding(.top, 2)
+            } else {
+                ScrubbableProgressBar(elapsed: elapsed, duration: duration) { newTime in
+                    seekToPosition(newTime)
+                }
+                .padding(.vertical, 2)
+                
+                HStack {
+                    Text(formatTime(elapsed))
                         .font(.system(size: 7, weight: .regular, design: .rounded))
                         .foregroundColor(.white.opacity(0.4))
-                }
-            }
-            .offset(y: -4)
-            
-            HStack {
-                miniPlayerControls
-                
-                Spacer()
-                
-                if !outputName.isEmpty {
-                    HStack(spacing: 3) {
-                        Image(systemName: "speaker.wave.2.fill")
-                            .font(.system(size: 7))
-                        Text(outputName.prefix(12) + (outputName.count > 12 ? ".." : ""))
-                            .font(.system(size: 7, weight: .medium, design: .rounded))
-                            .lineLimit(1)
+                    Spacer()
+                    if duration > 0 {
+                        Text(formatTime(duration))
+                            .font(.system(size: 7, weight: .regular, design: .rounded))
+                            .foregroundColor(.white.opacity(0.4))
                     }
-                    .foregroundColor(.white.opacity(0.4))
                 }
+                .offset(y: -4)
+                
+                HStack {
+                    miniPlayerControls
+                    
+                    Spacer()
+                    
+                    if !outputName.isEmpty {
+                        HStack(spacing: 3) {
+                            Image(systemName: "speaker.wave.2.fill")
+                                .font(.system(size: 7))
+                            Text(outputName.prefix(12) + (outputName.count > 12 ? ".." : ""))
+                                .font(.system(size: 7, weight: .medium, design: .rounded))
+                                .lineLimit(1)
+                        }
+                        .foregroundColor(.white.opacity(0.4))
+                    }
+                }
+                .offset(y: -4)
             }
-            .offset(y: -4)
         }
         .padding(.vertical, 10)
         .padding(.horizontal, 10)
@@ -1709,25 +1741,17 @@ struct NotchView: View {
                         .font(.system(size: 9, weight: .semibold, design: .rounded))
                         .foregroundColor(.white.opacity(0.8))
                     Spacer()
-                    if batterySaverMode {
-                        Text("SAVED")
-                            .font(.system(size: 8, weight: .bold, design: .rounded))
-                            .foregroundColor(.green.opacity(0.8))
-                    } else {
-                        Text(String(format: "%.0f%%", systemMonitor.cpuUsage))
-                            .font(.system(size: 9, weight: .bold, design: .rounded))
-                            .foregroundColor(.white)
-                    }
+                    Text(String(format: "%.0f%%", systemMonitor.cpuUsage))
+                        .font(.system(size: 9, weight: .bold, design: .rounded))
+                        .foregroundColor(.white)
                 }
                 ZStack(alignment: .leading) {
                     Capsule()
                         .fill(Color.white.opacity(0.1))
                         .frame(height: 4)
-                    if !batterySaverMode {
-                        Capsule()
-                            .fill(LinearGradient(gradient: Gradient(colors: [.blue, .purple]), startPoint: .leading, endPoint: .trailing))
-                            .frame(width: CGFloat(min(max(systemMonitor.cpuUsage / 100.0, 0), 1)) * 120, height: 4)
-                    }
+                    Capsule()
+                        .fill(Color.white.opacity(0.75))
+                        .frame(width: CGFloat(min(max(systemMonitor.cpuUsage / 100.0, 0), 1)) * 120, height: 4)
                 }
             }
 
@@ -1737,25 +1761,17 @@ struct NotchView: View {
                         .font(.system(size: 9, weight: .semibold, design: .rounded))
                         .foregroundColor(.white.opacity(0.8))
                     Spacer()
-                    if batterySaverMode {
-                        Text("SAVED")
-                            .font(.system(size: 8, weight: .bold, design: .rounded))
-                            .foregroundColor(.green.opacity(0.8))
-                    } else {
-                        Text(String(format: "%.0f%%", systemMonitor.ramUsage))
-                            .font(.system(size: 9, weight: .bold, design: .rounded))
-                            .foregroundColor(.white)
-                    }
+                    Text(String(format: "%.0f%%", systemMonitor.ramUsage))
+                        .font(.system(size: 9, weight: .bold, design: .rounded))
+                        .foregroundColor(.white)
                 }
                 ZStack(alignment: .leading) {
                     Capsule()
                         .fill(Color.white.opacity(0.1))
                         .frame(height: 4)
-                    if !batterySaverMode {
-                        Capsule()
-                            .fill(LinearGradient(gradient: Gradient(colors: [.purple, .pink]), startPoint: .leading, endPoint: .trailing))
-                            .frame(width: CGFloat(min(max(systemMonitor.ramUsage / 100.0, 0), 1)) * 120, height: 4)
-                    }
+                    Capsule()
+                        .fill(Color.white.opacity(0.75))
+                        .frame(width: CGFloat(min(max(systemMonitor.ramUsage / 100.0, 0), 1)) * 120, height: 4)
                 }
             }
 
@@ -1763,16 +1779,16 @@ struct NotchView: View {
                 HStack(spacing: 4) {
                     Image(systemName: "arrow.down")
                         .font(.system(size: 8, weight: .bold))
-                        .foregroundColor(batterySaverMode ? .white.opacity(0.3) : .green)
-                    Text(batterySaverMode ? "— MB/s" : formatSpeed(systemMonitor.downloadSpeed))
+                        .foregroundColor(.white.opacity(0.6))
+                    Text(formatSpeed(systemMonitor.downloadSpeed))
                         .font(.system(size: 9, weight: .semibold, design: .rounded))
-                        .foregroundColor(.white.opacity(batterySaverMode ? 0.4 : 0.85))
+                        .foregroundColor(.white.opacity(0.85))
                 }
                 HStack(spacing: 4) {
                     Image(systemName: "arrow.up")
                         .font(.system(size: 8, weight: .bold))
-                        .foregroundColor(batterySaverMode ? .white.opacity(0.3) : .blue)
-                    Text(batterySaverMode ? "— KB/s" : formatSpeed(systemMonitor.uploadSpeed))
+                        .foregroundColor(.white.opacity(0.6))
+                    Text(formatSpeed(systemMonitor.uploadSpeed))
                         .font(.system(size: 9, weight: .semibold, design: .rounded))
                         .foregroundColor(.white.opacity(0.85))
                 }
@@ -1831,7 +1847,7 @@ struct NotchView: View {
                 set frontTab to tab frontIndex of front window
                 set frontURL to URL of frontTab
                 if frontURL contains "spotify.com" then
-                    set result to execute javascript "\(escaped)" in frontTab
+                    tell frontTab to set result to execute javascript "\(escaped)"
                     return (result as text)
                 end if
             end try
@@ -1840,7 +1856,7 @@ struct NotchView: View {
                     try
                         set theURL to URL of t
                         if theURL contains "spotify.com" then
-                            set result to execute javascript "\(escaped)" in t
+                            tell t to set result to execute javascript "\(escaped)"
                             return (result as text)
                         end if
                     end try
@@ -1849,39 +1865,31 @@ struct NotchView: View {
             return "false"
         end tell
         """
-        let result = runAppleScriptResult(script) ?? "false"
+        let result = runAppleScriptResult(script, isJavaScript: true) ?? "false"
         return result.lowercased().contains("true")
     }
 
     private var browserPermissionPanel: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("Enable Spotify in browser")
-                .font(.system(size: 10, weight: .semibold, design: .rounded))
-                .foregroundColor(.white)
-                .lineLimit(1)
-
-            Text("Allow Notch to read the active tab.")
-                .font(.system(size: 9, weight: .regular, design: .rounded))
-                .foregroundColor(.white.opacity(0.7))
-                .lineLimit(1)
-
-            Button {
-            } label: {
-                Text("Enable")
-                    .font(.system(size: 10, weight: .semibold, design: .rounded))
-                    .padding(.vertical, 4)
-                    .padding(.horizontal, 10)
-                    .background(Color.white.opacity(0.12))
-                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 4) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundColor(.yellow)
+                    .font(.system(size: 10))
+                Text("Brave Spotify Integration")
+                    .font(.system(size: 9, weight: .bold, design: .rounded))
+                    .foregroundColor(.white)
             }
-            .buttonStyle(.plain)
-            .foregroundColor(.white)
+            
+            Text("Enable 'Allow JavaScript from Apple Events' in Brave's 'View' > 'Developer' menu.")
+                .font(.system(size: 8, weight: .medium, design: .rounded))
+                .foregroundColor(.white.opacity(0.7))
+                .lineLimit(3)
+                .multilineTextAlignment(.leading)
         }
-        .padding(.vertical, 6)
-        .padding(.horizontal, 8)
-        .background(Color.white.opacity(0.06))
-        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-        .frame(maxWidth: 230, alignment: .leading)
+        .padding(8)
+        .background(Color.yellow.opacity(0.12))
+        .cornerRadius(8)
+        .frame(width: 140, alignment: .leading)
     }
 
     private var appIconView: some View {
@@ -1946,7 +1954,7 @@ struct NotchView: View {
 
     private func updateFallbackPollingForCurrentState() {
         if isHovered {
-            nowPlayingManager.startFallbackPolling(interval: 12.0)
+            nowPlayingManager.startFallbackPolling(interval: batterySaverMode ? 30.0 : 12.0)
             return
         }
         if batterySaverMode {
@@ -1954,7 +1962,7 @@ struct NotchView: View {
             return
         }
         if nowPlayingManager.effectiveIsPlaying {
-            nowPlayingManager.startFallbackPolling(interval: 30.0)
+            nowPlayingManager.startFallbackPolling(interval: 45.0)
         } else {
             nowPlayingManager.stopFallbackPolling()
         }
@@ -2072,14 +2080,12 @@ struct NotchView: View {
             }
             .offset(y: 1)
         .onHover { hovering in
-            debugLog("[DEBUG] NotchView: onHover change: \(hovering)")
+            debugLog("[DEBUG] NotchView: onHover change: \(hovering), batterySaverMode=\(batterySaverMode)")
             isHovered = hovering
             onHoverChange(hovering)
             if hovering {
-                nowPlayingManager.startFallbackPolling(interval: 12.0)
-                if !batterySaverMode {
-                    systemMonitor.startMonitoring(interval: 1.5)
-                }
+                nowPlayingManager.startFallbackPolling(interval: batterySaverMode ? 30.0 : 12.0)
+                systemMonitor.startMonitoring(interval: batterySaverMode ? 5.0 : 1.5)
                 if appListTimer == nil {
                     updateRunningApps()
                     appListTimer = Timer.scheduledTimer(withTimeInterval: 8, repeats: true) { _ in
@@ -2120,8 +2126,8 @@ struct NotchView: View {
             updateOutputDeviceName()
             updateRunningApps()
             updateFallbackPollingForCurrentState()
-            if isHovered && !batterySaverMode {
-                systemMonitor.startMonitoring(interval: 1.5)
+            if isHovered {
+                systemMonitor.startMonitoring(interval: batterySaverMode ? 5.0 : 1.5)
             }
             let ws = NSWorkspace.shared.notificationCenter
             appListObserverTokens = [
@@ -2146,10 +2152,8 @@ struct NotchView: View {
         }
         .onChange(of: batterySaverMode) { _, saver in
             updateFallbackPollingForCurrentState()
-            if saver {
-                systemMonitor.stopMonitoring()
-            } else if isHovered {
-                systemMonitor.startMonitoring(interval: 1.5)
+            if isHovered {
+                systemMonitor.startMonitoring(interval: saver ? 5.0 : 1.5)
             }
         }
         .onDisappear {
