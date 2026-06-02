@@ -889,14 +889,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let notchWidth: CGFloat = 370
         let notchHeight: CGFloat = 33
         
-        let expandedWidth: CGFloat = max(480, (screenRect.width * 0.25) + 50)
-        let expandedHeight: CGFloat = 198
+        let baseExpandedWidth = max(480, (screenRect.width * 0.25) + 50)
+        let expandedWidth = baseExpandedWidth + 5
+        let expandedHeight: CGFloat = 172
         
         // The *window* needs to be large enough to contain the *expanded* notch, even when it's small.
         // Otherwise, the notch will clip when it animates open.
-        // We position this invisible bounding box at the top center.
+        // We position this invisible bounding box at the top center, shifted 5px to the left
+        // to accommodate the extra width on the left side of the notch when hovered.
         let windowRect = NSRect(
-            x: (screenRect.width - expandedWidth) / 2.0,
+            x: (screenRect.width - baseExpandedWidth) / 2.0 - 5,
             y: screenRect.height - expandedHeight + 1, // Still push it up +1 to hide the top edge
             width: expandedWidth,
             height: expandedHeight
@@ -1232,10 +1234,6 @@ struct NotchView: View {
     @StateObject private var nowPlayingManager = NowPlayingManager()
     @State private var outputDeviceName: String = ""
     @State private var outputDeviceTimer: Timer?
-    @State private var runningApps: [NSRunningApplication] = []
-    @State private var appListTimer: Timer?
-    @State private var appListObserverTokens: [NSObjectProtocol] = []
-    @State private var appIconCache: [pid_t: NSImage] = [:]
     @State private var activeAppIcon: NSImage?
     @State private var activeAppName: String?
     @State private var activeAppBundleID: String?
@@ -1289,70 +1287,7 @@ struct NotchView: View {
         }
     }
 
-    private func updateRunningApps() {
-        let apps = NSWorkspace.shared.runningApplications
-            .filter { $0.activationPolicy == .regular || $0.activationPolicy == .accessory }
-            .filter { $0.bundleIdentifier != Bundle.main.bundleIdentifier }
-            .filter { $0.isTerminated == false }
-
-        // De-dupe by bundle id, prefer active instance
-        var seen: Set<String> = []
-        var deduped: [NSRunningApplication] = []
-        for app in apps {
-            let id = app.bundleIdentifier ?? "\(app.processIdentifier)"
-            if seen.contains(id) { continue }
-            seen.insert(id)
-            deduped.append(app)
-        }
-
-        let newIDs = deduped.map { $0.processIdentifier }
-        let currentIDs = runningApps.map { $0.processIdentifier }
-        if newIDs == currentIDs { return }
-        DispatchQueue.main.async {
-            self.runningApps = deduped
-            var newCache: [pid_t: NSImage] = [:]
-            for app in deduped {
-                if let existing = self.appIconCache[app.processIdentifier] {
-                    newCache[app.processIdentifier] = existing
-                } else if let icon = app.icon {
-                    newCache[app.processIdentifier] = icon
-                }
-            }
-            self.appIconCache = newCache
-        }
-    }
-
-    private var appCarouselView: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 6) {
-                ForEach(runningApps, id: \.processIdentifier) { app in
-                    Button {
-                        app.activate()
-                    } label: {
-                        if let icon = appIconCache[app.processIdentifier] ?? app.icon {
-                            Image(nsImage: icon)
-                                .resizable()
-                                .scaledToFit()
-                        } else {
-                            Image(systemName: "app")
-                                .resizable()
-                                .scaledToFit()
-                                .foregroundColor(.white.opacity(0.7))
-                        }
-                    }
-                    .buttonStyle(.plain)
-                    .frame(width: 18, height: 18)
-                    .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
-                }
-            }
-            .padding(.horizontal, 6)
-            .padding(.vertical, 4)
-        }
-        .frame(width: 140, height: 26)
-        .background(Color.white.opacity(0.05))
-        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-        .transaction { $0.animation = nil }
-    }
+    // App carousel removed
     
     private func batteryIconName(level: Int, isCharging: Bool) -> String {
         switch level {
@@ -2068,13 +2003,8 @@ struct NotchView: View {
                                     miniPlayerPanel
                                 }
                                 
-                                // Column 2: Clipboard & App Switcher Panel
-                                VStack(alignment: .leading, spacing: 6) {
-                                    clipboardPanel
-                                    
-                                    appCarouselView
-                                        .offset(y: 2)
-                                }
+                                // Column 2: Clipboard Panel
+                                clipboardPanel
                                 
                                 // Column 3: System Stats Panel
                                 VStack(alignment: .trailing, spacing: 6) {
@@ -2140,13 +2070,14 @@ struct NotchView: View {
                         .padding(.leading, shouldShowPlayer ? 20 : 18)
                         .padding(.trailing, shouldShowPlayer ? 29 : 18)
                         .frame(
-                            width: shouldShowPlayer ? expandedWidth : baseWidth,
+                            width: shouldShowPlayer ? (expandedWidth - 5) : baseWidth,
                             height: shouldShowPlayer ? expandedHeight : baseHeight,
                             alignment: .top
-                        )
+                        ),
+                        alignment: shouldShowPlayer ? .topTrailing : .center
                     )
             }
-            .offset(y: 1)
+            .offset(x: shouldShowPlayer ? 0 : 2.5, y: 1)
         .onHover { hovering in
             debugLog("[DEBUG] NotchView: onHover change: \(hovering), batterySaverMode=\(batterySaverMode)")
             isHovered = hovering
@@ -2154,12 +2085,6 @@ struct NotchView: View {
             if hovering {
                 nowPlayingManager.startFallbackPolling(interval: batterySaverMode ? 30.0 : 12.0)
                 systemMonitor.startMonitoring(interval: batterySaverMode ? 5.0 : 1.5)
-                if appListTimer == nil {
-                    updateRunningApps()
-                    appListTimer = Timer.scheduledTimer(withTimeInterval: 8, repeats: true) { _ in
-                        updateRunningApps()
-                    }
-                }
                 updateOutputDeviceName()
                 if outputDeviceTimer == nil {
                     outputDeviceTimer = Timer.scheduledTimer(withTimeInterval: 20, repeats: true) { _ in
@@ -2169,8 +2094,6 @@ struct NotchView: View {
             } else {
                 updateFallbackPollingForCurrentState()
                 systemMonitor.stopMonitoring()
-                appListTimer?.invalidate()
-                appListTimer = nil
                 outputDeviceTimer?.invalidate()
                 outputDeviceTimer = nil
             }
@@ -2192,24 +2115,10 @@ struct NotchView: View {
             }
             onHoverChange(isHovered)
             updateOutputDeviceName()
-            updateRunningApps()
             updateFallbackPollingForCurrentState()
             if isHovered {
                 systemMonitor.startMonitoring(interval: batterySaverMode ? 5.0 : 1.5)
             }
-            let ws = NSWorkspace.shared.notificationCenter
-            appListObserverTokens = [
-                ws.addObserver(forName: NSWorkspace.didLaunchApplicationNotification, object: nil, queue: .main) { _ in
-                    if self.isHovered {
-                        updateRunningApps()
-                    }
-                },
-                ws.addObserver(forName: NSWorkspace.didTerminateApplicationNotification, object: nil, queue: .main) { _ in
-                    if self.isHovered {
-                        updateRunningApps()
-                    }
-                }
-            ]
         }
         .onChange(of: nowPlayingManager.effectiveIsPlaying) { _, playing in
             if playing {
@@ -2231,12 +2140,6 @@ struct NotchView: View {
             }
             outputDeviceTimer?.invalidate()
             outputDeviceTimer = nil
-            appListTimer?.invalidate()
-            appListTimer = nil
-            for t in appListObserverTokens {
-                NSWorkspace.shared.notificationCenter.removeObserver(t)
-            }
-            appListObserverTokens = []
         }
     }
 
