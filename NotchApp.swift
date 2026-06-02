@@ -891,7 +891,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         
         let baseExpandedWidth = max(480, (screenRect.width * 0.25) + 50)
         let expandedWidth = baseExpandedWidth + 5
-        let expandedHeight: CGFloat = 172
+        let expandedHeight: CGFloat = 192
         
         // The *window* needs to be large enough to contain the *expanded* notch, even when it's small.
         // Otherwise, the notch will clip when it animates open.
@@ -1073,9 +1073,95 @@ class ClipboardManager: ObservableObject {
     }
 }
 
+class SystemControlsManager: ObservableObject {
+    @Published var isMuted: Bool = false
+    @Published var isOutputMuted: Bool = false
+    private var pollTimer: Timer?
+    
+    init() {
+        updateStates()
+        pollTimer = Timer.scheduledTimer(withTimeInterval: 4.0, repeats: true) { [weak self] _ in
+            self?.updateStates()
+        }
+    }
+    
+    deinit {
+        pollTimer?.invalidate()
+    }
+    
+    func updateStates() {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let micScript = "input volume of (get volume settings)"
+            var error: NSDictionary?
+            var muted = false
+            if let script = NSAppleScript(source: micScript) {
+                let output = script.executeAndReturnError(&error)
+                if error == nil {
+                    let volumeVal = output.int32Value
+                    muted = (volumeVal == 0)
+                }
+            }
+            
+            let outputScript = "output muted of (get volume settings)"
+            var outputMuted = false
+            if let script = NSAppleScript(source: outputScript) {
+                let output = script.executeAndReturnError(&error)
+                if error == nil {
+                    outputMuted = output.booleanValue
+                }
+            }
+            
+            DispatchQueue.main.async {
+                self.isMuted = muted
+                self.isOutputMuted = outputMuted
+            }
+        }
+    }
+    
+    func toggleMute() {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let currentMuted = self.isMuted
+            let newVol = currentMuted ? 75 : 0
+            let scriptStr = "set volume input volume \(newVol)"
+            var error: NSDictionary?
+            if let script = NSAppleScript(source: scriptStr) {
+                script.executeAndReturnError(&error)
+            }
+            self.updateStates()
+        }
+    }
+    
+    func toggleOutputMute() {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let currentMuted = self.isOutputMuted
+            let scriptStr = currentMuted ? "set volume without output muted" : "set volume with output muted"
+            var error: NSDictionary?
+            if let script = NSAppleScript(source: scriptStr) {
+                script.executeAndReturnError(&error)
+            }
+            self.updateStates()
+        }
+    }
+    
+    func takeScreenshot() {
+        let task = Process()
+        task.launchPath = "/usr/sbin/screencapture"
+        task.arguments = ["-i", "-c"]
+        task.launch()
+    }
+    
+    func lockScreen() {
+        let task = Process()
+        task.launchPath = "/usr/bin/pmset"
+        task.arguments = ["displaysleepnow"]
+        task.launch()
+    }
+}
+
 class SystemMonitor: ObservableObject {
     @Published var cpuUsage: Double = 0.0
     @Published var ramUsage: Double = 0.0
+    @Published var diskUsage: Double = 0.0
     @Published var downloadSpeed: Double = 0.0
     @Published var uploadSpeed: Double = 0.0
     
@@ -1108,13 +1194,46 @@ class SystemMonitor: ObservableObject {
         let cpu = getHostCPUUsage()
         let ram = getHostRAMUsage()
         let net = getNetworkSpeeds()
-        debugLog("[DEBUG] SystemMonitor: updateStats - cpu=\(cpu), ram=\(ram), down=\(net.download), up=\(net.upload)")
+        let disk = getDiskUsage()
+        debugLog("[DEBUG] SystemMonitor: updateStats - cpu=\(cpu), ram=\(ram), disk=\(disk), down=\(net.download), up=\(net.upload)")
         
         DispatchQueue.main.async {
             self.cpuUsage = cpu
             self.ramUsage = ram
+            self.diskUsage = disk
             self.downloadSpeed = net.download
             self.uploadSpeed = net.upload
+        }
+    }
+    
+    private func getDiskUsage() -> Double {
+        let path = NSHomeDirectory()
+        do {
+            let attrs = try FileManager.default.attributesOfFileSystem(forPath: path)
+            if let size = attrs[.systemSize] as? UInt64,
+               let free = attrs[.systemFreeSize] as? UInt64,
+               size > 0 {
+                let used = size - free
+                return (Double(used) / Double(size)) * 100.0
+            }
+        } catch {
+            // Ignore
+        }
+        return 0.0
+    }
+    
+    var uptimeString: String {
+        let uptime = ProcessInfo.processInfo.systemUptime
+        let days = Int(uptime) / 86400
+        let hours = (Int(uptime) % 86400) / 3600
+        let minutes = (Int(uptime) % 3600) / 60
+        
+        if days > 0 {
+            return "\(days)d \(hours)h"
+        } else if hours > 0 {
+            return "\(hours)h \(minutes)m"
+        } else {
+            return "\(minutes)m"
         }
     }
     
@@ -1243,6 +1362,7 @@ struct NotchView: View {
     
     @StateObject private var systemMonitor = SystemMonitor()
     @StateObject private var clipboardManager = ClipboardManager()
+    @StateObject private var systemControlsManager = SystemControlsManager()
     @State private var copiedFeedbackId: UUID? = nil
     
     private func copyClipboardItem(_ item: ClipboardItem) {
@@ -1654,6 +1774,11 @@ struct NotchView: View {
                     }
                 }
                 .offset(y: -4)
+                
+                Spacer(minLength: 0)
+                
+                miniPlayerVisualizer
+                    .offset(y: -2)
             }
         }
         .padding(.vertical, 10)
@@ -1729,14 +1854,99 @@ struct NotchView: View {
         .frame(width: 140, height: 140, alignment: .topLeading)
     }
 
+    private var quickActionsPanel: some View {
+        HStack(spacing: 8) {
+            Button {
+                systemControlsManager.toggleMute()
+            } label: {
+                ZStack {
+                    Circle()
+                        .fill(systemControlsManager.isMuted ? Color.red.opacity(0.15) : Color.white.opacity(0.04))
+                    Image(systemName: systemControlsManager.isMuted ? "mic.slash.fill" : "mic.fill")
+                        .font(.system(size: 10))
+                        .foregroundColor(systemControlsManager.isMuted ? .red : .white.opacity(0.85))
+                }
+                .frame(width: 26, height: 26)
+                .overlay(
+                    Circle()
+                        .stroke(systemControlsManager.isMuted ? Color.red.opacity(0.3) : Color.white.opacity(0.05), lineWidth: 1)
+                )
+            }
+            .buttonStyle(.plain)
+            .help("Toggle Microphone Mute")
+            
+            Button {
+                systemControlsManager.takeScreenshot()
+            } label: {
+                ZStack {
+                    Circle()
+                        .fill(Color.white.opacity(0.04))
+                    Image(systemName: "camera.fill")
+                        .font(.system(size: 10))
+                        .foregroundColor(.white.opacity(0.85))
+                }
+                .frame(width: 26, height: 26)
+                .overlay(
+                    Circle()
+                        .stroke(Color.white.opacity(0.05), lineWidth: 1)
+                )
+            }
+            .buttonStyle(.plain)
+            .help("Interactive Screenshot")
+            
+            Button {
+                systemControlsManager.toggleOutputMute()
+            } label: {
+                ZStack {
+                    Circle()
+                        .fill(systemControlsManager.isOutputMuted ? Color.orange.opacity(0.15) : Color.white.opacity(0.04))
+                    Image(systemName: systemControlsManager.isOutputMuted ? "speaker.slash.fill" : "speaker.wave.2.fill")
+                        .font(.system(size: 10))
+                        .foregroundColor(systemControlsManager.isOutputMuted ? .orange : .white.opacity(0.85))
+                }
+                .frame(width: 26, height: 26)
+                .overlay(
+                    Circle()
+                        .stroke(systemControlsManager.isOutputMuted ? Color.orange.opacity(0.3) : Color.white.opacity(0.05), lineWidth: 1)
+                )
+            }
+            .buttonStyle(.plain)
+            .help("Toggle Mute Output")
+            
+            Button {
+                systemControlsManager.lockScreen()
+            } label: {
+                ZStack {
+                    Circle()
+                        .fill(Color.white.opacity(0.04))
+                    Image(systemName: "lock.fill")
+                        .font(.system(size: 10))
+                        .foregroundColor(.white.opacity(0.85))
+                }
+                .frame(width: 26, height: 26)
+                .overlay(
+                    Circle()
+                        .stroke(Color.white.opacity(0.05), lineWidth: 1)
+                )
+            }
+            .buttonStyle(.plain)
+            .help("Lock Screen")
+        }
+        .padding(.horizontal, 6)
+        .padding(.vertical, 4)
+        .frame(width: 140, height: 34)
+        .background(Color.white.opacity(0.03))
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+
     private var systemMonitorPanel: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 6) {
             Text("SYSTEM")
                 .font(.system(size: 8, weight: .bold, design: .rounded))
                 .foregroundColor(.white.opacity(0.4))
                 .tracking(1)
 
-            VStack(alignment: .leading, spacing: 3) {
+            VStack(alignment: .leading, spacing: 2) {
                 HStack {
                     Text("CPU")
                         .font(.system(size: 9, weight: .semibold, design: .rounded))
@@ -1756,7 +1966,7 @@ struct NotchView: View {
                 }
             }
 
-            VStack(alignment: .leading, spacing: 3) {
+            VStack(alignment: .leading, spacing: 2) {
                 HStack {
                     Text("RAM")
                         .font(.system(size: 9, weight: .semibold, design: .rounded))
@@ -1776,27 +1986,60 @@ struct NotchView: View {
                 }
             }
 
-            VStack(alignment: .leading, spacing: 4) {
-                HStack(spacing: 4) {
-                    Image(systemName: "arrow.down")
-                        .font(.system(size: 8, weight: .bold))
-                        .foregroundColor(.white.opacity(0.6))
-                    Text(formatSpeed(systemMonitor.downloadSpeed))
+            VStack(alignment: .leading, spacing: 2) {
+                HStack {
+                    Text("DISK")
                         .font(.system(size: 9, weight: .semibold, design: .rounded))
-                        .foregroundColor(.white.opacity(0.85))
+                        .foregroundColor(.white.opacity(0.8))
+                    Spacer()
+                    Text(String(format: "%.0f%%", systemMonitor.diskUsage))
+                        .font(.system(size: 9, weight: .bold, design: .rounded))
+                        .foregroundColor(.white)
                 }
-                HStack(spacing: 4) {
-                    Image(systemName: "arrow.up")
-                        .font(.system(size: 8, weight: .bold))
-                        .foregroundColor(.white.opacity(0.6))
-                    Text(formatSpeed(systemMonitor.uploadSpeed))
-                        .font(.system(size: 9, weight: .semibold, design: .rounded))
-                        .foregroundColor(.white.opacity(0.85))
+                ZStack(alignment: .leading) {
+                    Capsule()
+                        .fill(Color.white.opacity(0.1))
+                        .frame(height: 4)
+                    Capsule()
+                        .fill(Color.white.opacity(0.75))
+                        .frame(width: CGFloat(min(max(systemMonitor.diskUsage / 100.0, 0), 1)) * 120, height: 4)
                 }
             }
-            .padding(.top, 2)
+
+            HStack(spacing: 10) {
+                HStack(spacing: 3) {
+                    Image(systemName: "arrow.down")
+                        .font(.system(size: 7, weight: .bold))
+                        .foregroundColor(.white.opacity(0.5))
+                    Text(formatSpeed(systemMonitor.downloadSpeed))
+                        .font(.system(size: 8, weight: .semibold, design: .rounded))
+                        .foregroundColor(.white.opacity(0.8))
+                }
+                
+                HStack(spacing: 3) {
+                    Image(systemName: "arrow.up")
+                        .font(.system(size: 7, weight: .bold))
+                        .foregroundColor(.white.opacity(0.5))
+                    Text(formatSpeed(systemMonitor.uploadSpeed))
+                        .font(.system(size: 8, weight: .semibold, design: .rounded))
+                        .foregroundColor(.white.opacity(0.8))
+                }
+            }
+            .padding(.top, 1)
+
+            HStack {
+                Text("UPTIME")
+                    .font(.system(size: 7, weight: .bold, design: .rounded))
+                    .foregroundColor(.white.opacity(0.4))
+                    .tracking(0.5)
+                Spacer()
+                Text(systemMonitor.uptimeString)
+                    .font(.system(size: 8, weight: .semibold, design: .rounded))
+                    .foregroundColor(.white.opacity(0.8))
+            }
+            .padding(.top, 1)
         }
-        .padding(.vertical, 10)
+        .padding(.vertical, 8)
         .padding(.horizontal, 10)
         .background(Color.white.opacity(0.04))
         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
@@ -1940,12 +2183,38 @@ struct NotchView: View {
         .id(isPlaying)
     }
 
+    private var miniPlayerVisualizer: some View {
+        let isPlaying = nowPlayingManager.effectiveIsPlaying
+        return Group {
+            if isPlaying {
+                HStack(alignment: .bottom, spacing: 3) {
+                    ForEach(0..<22, id: \.self) { index in
+                        VisualizerBar(
+                            delay: Double(index) * 0.03,
+                            minVal: 0.1,
+                            maxVal: CGFloat.random(in: 0.5...1.0),
+                            isPlaying: isPlaying,
+                            width: 2.0,
+                            height: 12.0,
+                            opacity: 0.25
+                        )
+                    }
+                }
+                .transition(.opacity.combined(with: .scale(scale: 0.9, anchor: .bottom)))
+            } else {
+                Rectangle()
+                    .fill(Color.white.opacity(0.15))
+                    .frame(width: 107, height: 1.5)
+                    .transition(.opacity)
+            }
+        }
+        .frame(height: 12, alignment: .bottom)
+        .animation(.easeInOut(duration: 0.35), value: isPlaying)
+    }
+
     private var compactPlayingIndicator: some View {
-        Image(systemName: "waveform")
-            .font(.system(size: 11, weight: .semibold))
-            .foregroundColor(.white.opacity(0.9))
-            .frame(width: 20, height: 20, alignment: .center)
-            .offset(y: -2)
+        barsView
+            .offset(y: -1)
     }
 
     private var isFrontmostBrowser: Bool {
@@ -2003,8 +2272,12 @@ struct NotchView: View {
                                     miniPlayerPanel
                                 }
                                 
-                                // Column 2: Clipboard Panel
-                                clipboardPanel
+                                // Column 2: Clipboard & Quick Actions Panel
+                                VStack(alignment: .leading, spacing: 6) {
+                                    clipboardPanel
+                                    
+                                    quickActionsPanel
+                                }
                                 
                                 // Column 3: System Stats Panel
                                 VStack(alignment: .trailing, spacing: 6) {
@@ -2083,6 +2356,7 @@ struct NotchView: View {
             isHovered = hovering
             onHoverChange(hovering)
             if hovering {
+                systemControlsManager.updateStates()
                 nowPlayingManager.startFallbackPolling(interval: batterySaverMode ? 30.0 : 12.0)
                 systemMonitor.startMonitoring(interval: batterySaverMode ? 5.0 : 1.5)
                 updateOutputDeviceName()
@@ -2115,6 +2389,7 @@ struct NotchView: View {
             }
             onHoverChange(isHovered)
             updateOutputDeviceName()
+            systemControlsManager.updateStates()
             updateFallbackPollingForCurrentState()
             if isHovered {
                 systemMonitor.startMonitoring(interval: batterySaverMode ? 5.0 : 1.5)
@@ -2242,13 +2517,17 @@ struct VisualizerBar: View {
     let minVal: CGFloat
     let maxVal: CGFloat
     let isPlaying: Bool
+    var width: CGFloat = 1.5
+    var height: CGFloat = 18
+    var color: Color = .white
+    var opacity: Double = 0.9
     
     @State private var currentScale: CGFloat = 0.2
     
     var body: some View {
-        RoundedRectangle(cornerRadius: 1.5, style: .continuous)
-            .fill(Color.white.opacity(0.9))
-            .frame(width: 1.5, height: 18)
+        RoundedRectangle(cornerRadius: width / 2.0, style: .continuous)
+            .fill(color.opacity(opacity))
+            .frame(width: width, height: height)
             .scaleEffect(x: 1.0, y: isPlaying ? currentScale : minVal, anchor: .bottom)
             .onAppear {
                 currentScale = minVal
