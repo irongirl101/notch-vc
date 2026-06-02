@@ -39,7 +39,9 @@ extension NSImage {
 }
 
 final class NowPlayingManager: ObservableObject {
-    @Published var isPlaying: Bool = false
+    @Published var isPlaying: Bool = false {
+        didSet { updateProgressTimer() }
+    }
     @Published var nowPlayingAppIcon: NSImage?
     @Published var nowPlayingAppIconSmall: NSImage?
     @Published var nowPlayingArtwork: NSImage?
@@ -58,8 +60,12 @@ final class NowPlayingManager: ObservableObject {
     @Published var fallbackAppName: String?
     @Published var fallbackAppIcon: NSImage?
     @Published var fallbackArtwork: NSImage?
-    @Published var fallbackIsPlaying: Bool = false
-    @Published var fallbackPlaybackState: String = ""
+    @Published var fallbackIsPlaying: Bool = false {
+        didSet { updateProgressTimer() }
+    }
+    @Published var fallbackPlaybackState: String = "" {
+        didSet { updateProgressTimer() }
+    }
     @Published var fallbackLastUpdateAt: Date = .distantPast
     @Published var lastKnownTrackTitle: String?
     @Published var lastKnownTrackArtist: String?
@@ -71,6 +77,7 @@ final class NowPlayingManager: ObservableObject {
     private let queue = DispatchQueue.main
     private var observers: [NSObjectProtocol] = []
     private var fallbackTimer: Timer?
+    private var progressTimer: Timer?
     private var fallbackPollInterval: TimeInterval = 12.0
     private var lastFallbackRefreshAt: Date = .distantPast
     private var isRefreshingFallback: Bool = false
@@ -78,6 +85,38 @@ final class NowPlayingManager: ObservableObject {
     private var frontmostAppName: String?
     private var lastFallbackArtworkURL: String?
     private var lastDirectFallbackArtworkURL: String?
+
+    private func updateProgressTimer() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            if self.effectiveIsPlaying {
+                if self.progressTimer == nil {
+                    self.startProgressTimer()
+                }
+            } else {
+                self.stopProgressTimer()
+            }
+        }
+    }
+
+    private func startProgressTimer() {
+        progressTimer?.invalidate()
+        progressTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            if self.effectiveIsPlaying {
+                DispatchQueue.main.async {
+                    if self.trackElapsed < self.trackDuration {
+                        self.trackElapsed += 1.0
+                    }
+                }
+            }
+        }
+    }
+
+    private func stopProgressTimer() {
+        progressTimer?.invalidate()
+        progressTimer = nil
+    }
     private var lastFallbackWasSpotify: Bool = false
     private var hasOptimisticSpotifyToggleState: Bool = false
 
@@ -340,7 +379,7 @@ final class NowPlayingManager: ObservableObject {
         fallbackTimer = nil
     }
 
-    private func refreshBrowserFallback(force: Bool = false) {
+    func refreshBrowserFallback(force: Bool = false) {
         debugLog("[DEBUG] NowPlayingManager: refreshBrowserFallback() called (force=\(force))")
         if isRefreshingFallback { 
             debugLog("[DEBUG] NowPlayingManager: refreshBrowserFallback - already refreshing, aborting")
@@ -373,13 +412,15 @@ final class NowPlayingManager: ObservableObject {
         if let meta = runAppleScript(browserSpotifyTabMetadataScript(), isJavaScript: true) {
             debugLog("[DEBUG] NowPlayingManager: refreshBrowserFallback - meta raw: \(meta)")
             let parts = meta.components(separatedBy: "|||")
-            if parts.count >= 6 {
+            if parts.count >= 8 {
                 let title = parts[0]
                 let artist = parts[1]
                 let album = parts[2]
                 let artworkURL = parts[3]
                 let playbackState = parts[4]
-                let url = parts[5]
+                let elapsedSeconds = Double(parts[5]) ?? 0
+                let durationSeconds = Double(parts[6]) ?? 0
+                let url = parts[7]
                 if url.contains("spotify.com") {
                     lastFallbackWasSpotify = true
                     let parsed = parseSpotifyTitle(title)
@@ -415,6 +456,8 @@ final class NowPlayingManager: ObservableObject {
                         }
                         self.fallbackAppName = "Spotify (Brave)"
                         self.fallbackAppIcon = self.braveIcon()
+                        self.trackElapsed = elapsedSeconds
+                        self.trackDuration = durationSeconds
                         if !playbackState.isEmpty {
                             let braveIsPlaying = playbackState.lowercased() == "playing"
                             self.fallbackIsPlaying = braveIsPlaying
@@ -423,7 +466,7 @@ final class NowPlayingManager: ObservableObject {
                             self.hasOptimisticSpotifyToggleState = false
                         }
                         self.fallbackLastUpdateAt = Date()
-                        debugLog("[DEBUG] NowPlayingManager: refreshBrowserFallback - updated fallback values: Title=\(String(describing: self.fallbackTrackTitle)), Artist=\(String(describing: self.fallbackTrackArtist)), PlayState=\(self.fallbackPlaybackState)")
+                        debugLog("[DEBUG] NowPlayingManager: refreshBrowserFallback - updated fallback values: Title=\(String(describing: self.fallbackTrackTitle)), Artist=\(String(describing: self.fallbackTrackArtist)), PlayState=\(self.fallbackPlaybackState), Elapsed=\(self.trackElapsed), Duration=\(self.trackDuration)")
                     }
                     fetchDirectFallbackArtworkIfNeeded(artworkURLString: artworkURL)
                     fetchFallbackArtworkIfNeeded(pageURLString: url)
@@ -599,7 +642,20 @@ final class NowPlayingManager: ObservableObject {
               if (label.includes('play')) playback = 'paused';
             }
           }
-          return [title, artist, album, artwork, playback].join('|||');
+
+          const parseTime = (str) => {
+            if (!str) return 0;
+            const p = str.trim().split(':').map(Number);
+            if (p.length === 2) return p[0] * 60 + p[1];
+            if (p.length === 3) return p[0] * 3600 + p[1] * 60 + p[2];
+            return 0;
+          };
+          const elapsedEl = document.querySelector('[data-testid="playback-position"]');
+          const durationEl = document.querySelector('[data-testid="playback-duration"]');
+          const elapsed = elapsedEl ? parseTime(elapsedEl.textContent) : 0;
+          const duration = durationEl ? parseTime(durationEl.textContent) : 0;
+
+          return [title, artist, album, artwork, playback, elapsed, duration].join('|||');
         })();
         """
         let escaped = js
@@ -1551,6 +1607,11 @@ struct NotchView: View {
                 if command == .playPause {
                     nowPlayingManager.noteSpotifyPlayPauseToggle()
                 }
+                // Trigger immediate metadata refresh after a short delay (0.4s) to capture updates
+                let manager = self.nowPlayingManager
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                    manager.refreshBrowserFallback(force: true)
+                }
                 return
             }
         }
@@ -1830,11 +1891,13 @@ struct NotchView: View {
             const clickX = rect.left + (rect.width * \(ratio));
             const clickY = rect.top + (rect.height / 2);
             
-            const mousedown = new MouseEvent('mousedown', { clientX: clickX, clientY: clickY, bubbles: true });
-            const mouseup = new MouseEvent('mouseup', { clientX: clickX, clientY: clickY, bubbles: true });
+            const options = { clientX: clickX, clientY: clickY, bubbles: true, pointerId: 1, pointerType: 'mouse', isPrimary: true };
             
-            progressBar.dispatchEvent(mousedown);
-            progressBar.dispatchEvent(mouseup);
+            progressBar.dispatchEvent(new PointerEvent('pointerdown', options));
+            progressBar.dispatchEvent(new MouseEvent('mousedown', options));
+            progressBar.dispatchEvent(new PointerEvent('pointerup', options));
+            progressBar.dispatchEvent(new MouseEvent('mouseup', options));
+            progressBar.dispatchEvent(new MouseEvent('click', options));
             return true;
           }
           return false;
