@@ -138,7 +138,7 @@ final class NowPlayingManager: ObservableObject {
         }
         refresh()
         DispatchQueue.main.async { [weak self] in
-            self?.refreshBrowserFallback()
+            self?.refreshBrowserFallback(force: true)
         }
     }
 
@@ -320,12 +320,16 @@ final class NowPlayingManager: ObservableObject {
     func startFallbackPolling(interval: TimeInterval = 12.0) {
         let normalizedInterval = max(8.0, interval)
         if let timer = fallbackTimer {
-            if abs(fallbackPollInterval - normalizedInterval) < 0.01 { return }
+            if abs(fallbackPollInterval - normalizedInterval) < 0.01 {
+                // Polling interval is the same, but still trigger a refresh immediately (forced) to capture updates
+                refreshBrowserFallback(force: true)
+                return
+            }
             timer.invalidate()
             fallbackTimer = nil
         }
         fallbackPollInterval = normalizedInterval
-        refreshBrowserFallback()
+        refreshBrowserFallback(force: true) // Force immediate update when starting or changing polling
         fallbackTimer = Timer.scheduledTimer(withTimeInterval: normalizedInterval, repeats: true) { [weak self] _ in
             self?.refreshBrowserFallback()
         }
@@ -336,14 +340,14 @@ final class NowPlayingManager: ObservableObject {
         fallbackTimer = nil
     }
 
-    private func refreshBrowserFallback() {
-        debugLog("[DEBUG] NowPlayingManager: refreshBrowserFallback() called")
+    private func refreshBrowserFallback(force: Bool = false) {
+        debugLog("[DEBUG] NowPlayingManager: refreshBrowserFallback() called (force=\(force))")
         if isRefreshingFallback { 
             debugLog("[DEBUG] NowPlayingManager: refreshBrowserFallback - already refreshing, aborting")
             return 
         }
         let now = Date()
-        let minGap = max(4.0, fallbackPollInterval * 0.75)
+        let minGap = force ? 1.0 : max(4.0, fallbackPollInterval * 0.75)
         if now.timeIntervalSince(lastFallbackRefreshAt) < minGap { 
             debugLog("[DEBUG] NowPlayingManager: refreshBrowserFallback - throttled, gap is \(now.timeIntervalSince(lastFallbackRefreshAt))s (min \(minGap)s)")
             return 
@@ -527,32 +531,33 @@ final class NowPlayingManager: ObservableObject {
 
           // Fallback: scrape Spotify's now-playing footer/widget when Media Session is empty.
           const root = document.querySelector('[data-testid="now-playing-widget"]') ||
-                       document.querySelector('footer') ||
-                       document;
-          if (!title) {
-            const titleEl = root.querySelector('[data-testid="nowplaying-track-link"]') ||
-                            root.querySelector('[data-testid="context-item-link"]') ||
-                            root.querySelector('a[href*="/track/"]');
-            title = titleEl ? (titleEl.textContent || '').trim() : '';
-          }
-          if (!artist) {
-            const artistNodes = Array.from(
-              root.querySelectorAll('[data-testid="context-item-info-artist"] a, a[href*="/artist/"]')
-            ).filter((n) => {
-              const rect = n.getBoundingClientRect();
-              return rect.width > 0 && rect.height > 0;
-            });
-            if (artistNodes.length > 0) {
-              artist = artistNodes.map((n) => (n.textContent || '').trim()).filter(Boolean).join(', ');
+                       document.querySelector('footer');
+          if (root) {
+            if (!title) {
+              const titleEl = root.querySelector('[data-testid="nowplaying-track-link"]') ||
+                              root.querySelector('[data-testid="context-item-link"]') ||
+                              root.querySelector('a[href*="/track/"]');
+              title = titleEl ? (titleEl.textContent || '').trim() : '';
             }
-          }
-          if (!album) {
-            const albumEl = root.querySelector('a[href*="/album/"]');
-            album = albumEl ? (albumEl.textContent || '').trim() : '';
-          }
-          if (!artwork) {
-            const artEl = root.querySelector('img[src*="i.scdn.co/image"], img');
-            artwork = artEl ? (artEl.getAttribute('src') || '') : '';
+            if (!artist) {
+              const artistNodes = Array.from(
+                root.querySelectorAll('[data-testid="context-item-info-artist"] a, a[href*="/artist/"]')
+              ).filter((n) => {
+                const rect = n.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+              });
+              if (artistNodes.length > 0) {
+                artist = artistNodes.map((n) => (n.textContent || '').trim()).filter(Boolean).join(', ');
+              }
+            }
+            if (!album) {
+              const albumEl = root.querySelector('a[href*="/album/"]');
+              album = albumEl ? (albumEl.textContent || '').trim() : '';
+            }
+            if (!artwork) {
+              const artEl = root.querySelector('img[src*="i.scdn.co/image"], img');
+              artwork = artEl ? (artEl.getAttribute('src') || '') : '';
+            }
           }
 
           let rawPlayback = (navigator.mediaSession && navigator.mediaSession.playbackState) ? navigator.mediaSession.playbackState : '';
