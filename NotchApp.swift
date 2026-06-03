@@ -1,46 +1,54 @@
-import Cocoa
-import SwiftUI
-import CoreImage
-import CoreAudio
-import IOKit.hid
-import ApplicationServices
-import Foundation
-import AVFoundation
-import IOKit.ps
-import Darwin
+import Cocoa // typical macos framework - combines a bunch of macos apis; used for event handling. 
+import SwiftUI // typical, used to build UI 
+import CoreImage // image processing framework - for image tranformations and color adjustments 
+import CoreAudio // audio API - streams, audio routing, hardware interaction 
+import IOKit.hid // comms with keyboard,mouse etc etc 
+import ApplicationServices // accessibility APIs - global keyboard/mouse monitoring.
+import Foundation // core utility framework, strings, arrays, dicts, etc etc 
+import AVFoundation // High-level audio/video framework.
+import IOKit.ps // Power Source APIs - battery info
+import Darwin // access to low level Unix/MacOS functions and provides C apis 
 
+//immediate logging to terminal instead of buffering, thanks to fflush, as a string 
 func debugLog(_ message: String) {
     print(message)
     fflush(stdout)
 }
+// An extension in Swift lets you add new functionality to an existing type without modifying the original source code.
+// that creates a slightly muted, minimalist-looking version of an image using Core Image filters.
+// NSImage - App/UI layer 
+// CIImage - image processing layer 
+// CGImage - Raw Pixel Layer 
 
 extension NSImage {
-    func withMinimalistColors() -> NSImage {
-        guard let tiffData = self.tiffRepresentation,
-              let bitmapImage = NSBitmapImageRep(data: tiffData),
-              let ciImage = CIImage(bitmapImageRep: bitmapImage) else {
+    func withMinimalistColors() -> NSImage { // returns a new image with adjusted colors 
+        guard let tiffData = self.tiffRepresentation, // gets tiff ; guard = check a condition and exit early if the condition isn't met. 
+              let bitmapImage = NSBitmapImageRep(data: tiffData), // creates a bitmap rep for core image to work with 
+              let ciImage = CIImage(bitmapImageRep: bitmapImage) else { // then creates a CI Image 
             return self
         }
         
-        guard let filter = CIFilter(name: "CIColorControls") else { return self }
-        filter.setValue(ciImage, forKey: kCIInputImageKey)
+        guard let filter = CIFilter(name: "CIColorControls") else { return self } // creates a filter, CIColorControls can manage sat, brightness,contrast
+        filter.setValue(ciImage, forKey: kCIInputImageKey) // tells the filter which image to use 
         filter.setValue(0.4, forKey: kCIInputSaturationKey) // Muted saturation for a minimalist look
         filter.setValue(0.1, forKey: kCIInputBrightnessKey) // Slight brightness boost
         filter.setValue(1.1, forKey: kCIInputContrastKey)   // Slight contrast boost to keep it crisp
         
-        guard let outputCIImage = filter.outputImage else { return self }
+        guard let outputCIImage = filter.outputImage else { return self } // gets the filtered output 
         
-        let context = CIContext(options: nil)
-        if let cgImage = context.createCGImage(outputCIImage, from: outputCIImage.extent) {
-            return NSImage(cgImage: cgImage, size: self.size)
+        let context = CIContext(options: nil) // responsible for results 
+        if let cgImage = context.createCGImage(outputCIImage, from: outputCIImage.extent) { // creates a real bitmap image from the filtered result
+            return NSImage(cgImage: cgImage, size: self.size) // convert back to NSImage 
         }
         return self
     }
 }
 
-final class NowPlayingManager: ObservableObject {
-    @Published var isPlaying: Bool = false {
-        didSet { updateProgressTimer() }
+// central manager for music/media playback state
+final class NowPlayingManager: ObservableObject { // final == no class can ingerit from this one. , ObservableObject == allows swiftui views to automatically update when properties change.
+    // @Published - Notify SwiftUI whenever this value changes.
+    @Published var isPlaying: Bool = false { // stores whenever playback is active
+        didSet { updateProgressTimer() } // didset - Runs automatically whenever the value changes
     }
     @Published var nowPlayingAppIcon: NSImage?
     @Published var nowPlayingAppIconSmall: NSImage?
@@ -66,7 +74,7 @@ final class NowPlayingManager: ObservableObject {
     @Published var fallbackPlaybackState: String = "" {
         didSet { updateProgressTimer() }
     }
-    @Published var fallbackLastUpdateAt: Date = .distantPast
+    @Published var fallbackLastUpdateAt: Date = .distantPast // distantpast is a placeholder - a very old date 
     @Published var lastKnownTrackTitle: String?
     @Published var lastKnownTrackArtist: String?
     @Published var lastKnownTrackAlbum: String?
@@ -79,22 +87,24 @@ final class NowPlayingManager: ObservableObject {
     private var fallbackTimer: Timer?
     private var progressTimer: Timer?
     private var fallbackPollInterval: TimeInterval = 12.0
-    private var lastFallbackRefreshAt: Date = .distantPast
+    private var lastFallbackRefreshAt: Date = .distantPast 
     private var isRefreshingFallback: Bool = false
     private var frontmostBundleID: String?
     private var frontmostAppName: String?
     private var lastFallbackArtworkURL: String?
     private var lastDirectFallbackArtworkURL: String?
 
+    // whether a timer should be running based on the current playback state - as in should the timer be running even when its on paused state 
     private func updateProgressTimer() {
-        DispatchQueue.main.async { [weak self] in
-            guard let self = self else { return }
-            if self.effectiveIsPlaying {
-                if self.progressTimer == nil {
-                    self.startProgressTimer()
+        // main thread 
+        DispatchQueue.main.async { [weak self] in // weak self - prevents a strong reference cycle - refer to this object, but dont keep it alive - when deinit, the the allocation has been removed in all or changed to nil. 
+            guard let self = self else { return } // as self is weak, it might have disappeared before the closure executes 
+            if self.effectiveIsPlaying { // checking if self is playing anythign or not 
+                if self.progressTimer == nil { // checking if timer already exists - avoiding the possibility of making multiple timers
+                    self.startProgressTimer() // start playing timer 
                 }
             } else {
-                self.stopProgressTimer()
+                self.stopProgressTimer() // stop timer 
             }
         }
     }
@@ -2294,6 +2304,7 @@ struct NotchView: View {
                                                 .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
                                         }
                                         .buttonStyle(.plain)
+                                        .help("Toggle App Battery Saver Mode (reduces polling rates)")
                                         
                                         Button {
                                             if let url = URL(string: "x-apple.systempreferences:com.apple.preference.battery") {
