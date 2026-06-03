@@ -110,51 +110,60 @@ final class NowPlayingManager: ObservableObject { // final == no class can inger
     }
 
     private func startProgressTimer() {
-        progressTimer?.invalidate()
-        progressTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-            guard let self = self else { return }
-            if self.effectiveIsPlaying {
-                DispatchQueue.main.async {
-                    if self.trackElapsed < self.trackDuration {
-                        self.trackElapsed += 1.0
+        progressTimer?.invalidate() // stops the timer permananently - kills an older timer 
+        progressTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in // creates a new timer, with specific time interval, and to keep running until invalidated. '_' represents the timer object itself. weak self in order to prevent a cycle
+            guard let self = self else { return } // unwrapping self, allowing cycle to break due to weak self upon closure exit
+            if self.effectiveIsPlaying { // check if music is playing 
+                DispatchQueue.main.async { // timer logic 
+                    if self.trackElapsed < self.trackDuration { // prevent overshooting 
+                        self.trackElapsed += 1.0 
                     }
                 }
             }
         }
     }
 
-    private func stopProgressTimer() {
+    private func stopProgressTimer() { // stops timer. and invalidates it. the timer goes back to 0 or nil 
         progressTimer?.invalidate()
         progressTimer = nil
     }
-    private var lastFallbackWasSpotify: Bool = false
+    private var lastFallbackWasSpotify: Bool = false // for whether the last fallback was from spotify 
     private var hasOptimisticSpotifyToggleState: Bool = false
 
+    // typealias - gives a complicated type a simpler name ; goes for both types and functions  
+    // convention - function follows the C convention, even if Swift offers its own ABI. 
+    // these are function types 
     private typealias MRRegisterFn = @convention(c) (DispatchQueue) -> Void
+
+    //escaping is used when a closure (a block of code) is allowed to outlive the function it's passed into. -> Void (callback returns a void)
     private typealias MRGetPIDFn = @convention(c) (DispatchQueue, @escaping (Int32) -> Void) -> Void
     private typealias MRGetIsPlayingFn = @convention(c) (DispatchQueue, @escaping (Bool) -> Void) -> Void
     private typealias MRGetNowPlayingInfoFn = @convention(c) (DispatchQueue, @escaping ([String: Any]) -> Void) -> Void
     private typealias MRSendCommandFn = @convention(c) (Int32, Any?) -> Bool
 
+    // variables that can hold functions, to call them safely in swift, given that they are C functions 
     private let mrRegister: MRRegisterFn?
     private let mrGetPID: MRGetPIDFn?
     private let mrGetIsPlaying: MRGetIsPlayingFn?
     private let mrGetNowPlayingInfo: MRGetNowPlayingInfoFn?
     private let mrSendCommand: MRSendCommandFn?
 
-    init() {
-        debugLog("[DEBUG] NowPlayingManager: Loading MediaRemote framework...")
-        let url = NSURL(fileURLWithPath: "/System/Library/PrivateFrameworks/MediaRemote.framework")
+    init() { // class constructor 
+        debugLog("[DEBUG] NowPlayingManager: Loading MediaRemote framework...") // logging for debugging 
+        let url = NSURL(fileURLWithPath: "/System/Library/PrivateFrameworks/MediaRemote.framework") // URL pointing to framework (macos Framework)
+
+        //local frameworks - creating a foundation bundle object 
         let b = CFBundleCreate(kCFAllocatorDefault, url)
         bundle = b
 
-        func load<T>(_ name: String, as type: T.Type) -> T? {
-            guard let b else { return nil }
-            guard let ptr = CFBundleGetFunctionPointerForName(b, name as CFString) else {
-                debugLog("[DEBUG] NowPlayingManager: Failed to load function \(name)")
+        // helper function, only usuable during initialization 
+        func load<T>(_ name: String, as type: T.Type) -> T? { // load <T> -> function works for any type - you use it when you need a boilerplate
+            guard let b else { return nil } // checking if bundle exist 
+            guard let ptr = CFBundleGetFunctionPointerForName(b, name as CFString) else { // getting function pointer 
+                debugLog("[DEBUG] NowPlayingManager: Failed to load function \(name)") // failure management 
                 return nil
             }
-            return unsafeBitCast(ptr, to: type)
+            return unsafeBitCast(ptr, to: type) // 
         }
 
         mrRegister = load("MRMediaRemoteRegisterForNowPlayingNotifications", as: MRRegisterFn.self)
