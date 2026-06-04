@@ -163,7 +163,7 @@ final class NowPlayingManager: ObservableObject { // final == no class can inger
                 debugLog("[DEBUG] NowPlayingManager: Failed to load function \(name)") // failure management 
                 return nil
             }
-            return unsafeBitCast(ptr, to: type) // 
+            return unsafeBitCast(ptr, to: type) //  advanced 
         }
 
         mrRegister = load("MRMediaRemoteRegisterForNowPlayingNotifications", as: MRRegisterFn.self)
