@@ -638,18 +638,22 @@ final class NowPlayingManager: ObservableObject { // final == no class can inger
             }
           }
           if (!playback) {
-            const controls = document.querySelector('[data-testid="playback-controls"]') ||
-                             document.querySelector('footer') ||
-                             document;
-            const isVisible = (el) => {
-              if (!el) return false;
-              const rect = el.getBoundingClientRect();
-              return rect.width > 0 && rect.height > 0;
-            };
+            let controls = document.querySelector('[data-testid="playback-controls"]');
+            const hasControlBtn = (el) => el && (
+              el.querySelector('[data-testid="control-button-play"]') ||
+              el.querySelector('[data-testid="control-button-pause"]') ||
+              el.querySelector('[data-testid="control-button-playpause"]')
+            );
+            if (!hasControlBtn(controls)) {
+              controls = document.querySelector('footer');
+              if (!hasControlBtn(controls)) {
+                controls = document;
+              }
+            }
             const pauseBtn = controls.querySelector('[data-testid="control-button-pause"]');
             const playBtn = controls.querySelector('[data-testid="control-button-play"]');
-            if (isVisible(pauseBtn)) playback = 'playing';
-            else if (isVisible(playBtn)) playback = 'paused';
+            if (pauseBtn) playback = 'playing';
+            else if (playBtn) playback = 'paused';
             else {
               const playPauseBtn = controls.querySelector('[data-testid="control-button-playpause"]') ||
                                    controls.querySelector('button[aria-label="Pause"]') ||
@@ -1571,21 +1575,32 @@ struct NotchView: View {
         case .playPause:
             js = """
             (function(){
-              const root = document.querySelector('[data-testid="playback-controls"]') ||
-                           document.querySelector('footer') ||
-                           document;
+              let root = document.querySelector('[data-testid="playback-controls"]');
+              const hasControlBtn = (el) => el && (
+                el.querySelector('[data-testid="control-button-play"]') ||
+                el.querySelector('[data-testid="control-button-pause"]') ||
+                el.querySelector('[data-testid="control-button-playpause"]')
+              );
+              if (!hasControlBtn(root)) {
+                root = document.querySelector('footer');
+                if (!hasControlBtn(root)) {
+                  root = document;
+                }
+              }
               const isVisible = (el) => {
                 if (!el) return false;
                 const rect = el.getBoundingClientRect();
                 return rect.width > 0 && rect.height > 0;
               };
               const findVisible = (selectors) => {
+                let found = null;
                 for (const sel of selectors) {
                   const nodes = Array.from(root.querySelectorAll(sel));
                   const n = nodes.find(isVisible);
                   if (n) return n;
+                  if (nodes.length > 0 && !found) found = nodes[0];
                 }
-                return null;
+                return found;
               };
               const btn = findVisible([
                 '[data-testid="control-button-playpause"]',
@@ -1604,17 +1619,29 @@ struct NotchView: View {
         case .next:
             js = """
             (function(){
-              const root = document.querySelector('[data-testid="playback-controls"]') ||
-                           document.querySelector('footer') ||
-                           document;
+              let root = document.querySelector('[data-testid="playback-controls"]');
+              const hasControlBtn = (el) => el && (
+                el.querySelector('[data-testid="control-button-skip-forward"]') ||
+                el.querySelector('[data-testid="next-button"]') ||
+                el.querySelector('button[aria-label="Next"]') ||
+                el.querySelector('button[aria-label*="Next"]') ||
+                el.querySelector('button[title*="Next"]')
+              );
+              if (!hasControlBtn(root)) {
+                root = document.querySelector('footer');
+                if (!hasControlBtn(root)) {
+                  root = document;
+                }
+              }
               const isVisible = (el) => {
                 if (!el) return false;
                 const rect = el.getBoundingClientRect();
                 return rect.width > 0 && rect.height > 0;
               };
-              const btn = Array.from(root.querySelectorAll(
+              const nodes = Array.from(root.querySelectorAll(
                 '[data-testid="control-button-skip-forward"], button[data-testid="control-button-skip-forward"], [data-testid="next-button"], button[aria-label=\"Next\"], button[aria-label*=\"Next\"], button[title*=\"Next\"]'
-              )).find(isVisible) || null;
+              ));
+              const btn = nodes.find(isVisible) || nodes[0] || null;
               if (btn) { btn.click(); return true; }
               return false;
             })();
@@ -1622,17 +1649,29 @@ struct NotchView: View {
         case .previous:
             js = """
             (function(){
-              const root = document.querySelector('[data-testid="playback-controls"]') ||
-                           document.querySelector('footer') ||
-                           document;
+              let root = document.querySelector('[data-testid="playback-controls"]');
+              const hasControlBtn = (el) => el && (
+                el.querySelector('[data-testid="control-button-skip-back"]') ||
+                el.querySelector('[data-testid="prev-button"]') ||
+                el.querySelector('button[aria-label="Previous"]') ||
+                el.querySelector('button[aria-label*="Previous"]') ||
+                el.querySelector('button[title*="Previous"]')
+              );
+              if (!hasControlBtn(root)) {
+                root = document.querySelector('footer');
+                if (!hasControlBtn(root)) {
+                  root = document;
+                }
+              }
               const isVisible = (el) => {
                 if (!el) return false;
                 const rect = el.getBoundingClientRect();
                 return rect.width > 0 && rect.height > 0;
               };
-              const btn = Array.from(root.querySelectorAll(
+              const nodes = Array.from(root.querySelectorAll(
                 '[data-testid="control-button-skip-back"], button[data-testid="control-button-skip-back"], [data-testid="prev-button"], button[aria-label=\"Previous\"], button[aria-label*=\"Previous\"], button[title*=\"Previous\"]'
-              )).find(isVisible) || null;
+              ));
+              const btn = nodes.find(isVisible) || nodes[0] || null;
               if (btn) { btn.click(); return true; }
               return false;
             })();
@@ -2441,7 +2480,7 @@ struct NotchView: View {
     private var miniPlayerProgress: some View {
         let duration = nowPlayingManager.trackDuration
         let elapsed = nowPlayingManager.trackElapsed
-        let ratio = duration > 0 ? min(max(elapsed / duration, 0), 1) : 0
+        let ratio = (duration.isFinite && elapsed.isFinite && duration > 0) ? min(max(elapsed / duration, 0), 1) : 0
         return ZStack(alignment: .leading) {
             Capsule()
                 .fill(Color.white.opacity(0.15))
@@ -2455,12 +2494,13 @@ struct NotchView: View {
 
     private var miniPlayerTimeText: String? {
         let duration = nowPlayingManager.trackDuration
-        if duration <= 0 { return nil }
-        let elapsed = max(0, nowPlayingManager.trackElapsed)
+        guard duration.isFinite && duration > 0 else { return nil }
+        let elapsed = nowPlayingManager.trackElapsed.isFinite ? max(0, nowPlayingManager.trackElapsed) : 0
         return "\(formatTime(elapsed)) / \(formatTime(duration))"
     }
 
     private func formatTime(_ seconds: Double) -> String {
+        guard seconds.isFinite else { return "0:00" }
         let s = max(0, Int(seconds.rounded()))
         let m = s / 60
         let r = s % 60
@@ -2581,7 +2621,10 @@ struct ScrubbableProgressBar: View {
     @State private var dragProgress: Double? = nil
 
     var body: some View {
-        let displayProgress = dragProgress ?? (duration > 0 ? elapsed / duration : 0)
+        let hasValidDuration = duration.isFinite && duration > 0
+        let currentElapsed = elapsed.isFinite ? elapsed : 0
+        let displayProgress = dragProgress ?? (hasValidDuration ? currentElapsed / duration : 0)
+        let safeDisplayProgress = displayProgress.isFinite ? min(max(displayProgress, 0), 1) : 0
         return GeometryReader { geo in
             ZStack(alignment: .leading) {
                 Capsule()
@@ -2590,12 +2633,12 @@ struct ScrubbableProgressBar: View {
 
                 Capsule()
                     .fill(Color.white.opacity(0.7))
-                    .frame(width: CGFloat(displayProgress) * geo.size.width, height: 3)
+                    .frame(width: CGFloat(safeDisplayProgress) * geo.size.width, height: 3)
 
                 Circle()
                     .fill(Color.white)
                     .frame(width: 8, height: 8)
-                    .offset(x: CGFloat(displayProgress) * geo.size.width - 4)
+                    .offset(x: CGFloat(safeDisplayProgress) * geo.size.width - 4)
                     .shadow(color: Color.black.opacity(0.5), radius: 1)
             }
             .frame(height: 8)
